@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from io import BytesIO
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -248,7 +249,11 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
 
         async with UPLOAD_SEMAPHORE:
             if isinstance(message.media, MessageMediaPhoto):
-                kwargs = dict(file=media_bytes, caption=caption, force_document=False)
+                # Photo → toujours envoyé comme image (pas comme fichier)
+                file_io = BytesIO(media_bytes)
+                file_io.name = "photo.jpg"
+                kwargs = dict(file=file_io, caption=caption, force_document=False)
+
             elif isinstance(message.media, MessageMediaDocument):
                 doc = message.media.document
                 mime = doc.mime_type or ""
@@ -256,12 +261,40 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
                     type(attr).__name__ == "DocumentAttributeVideo"
                     for attr in (doc.attributes or [])
                 )
-                kwargs = dict(
-                    file=media_bytes,
-                    caption=caption,
-                    force_document=not is_video,
-                    attributes=doc.attributes if is_video else None,
+                is_image = mime.startswith("image/")
+                is_gif = mime == "image/gif" or any(
+                    type(attr).__name__ == "DocumentAttributeAnimated"
+                    for attr in (doc.attributes or [])
                 )
+
+                # Choisir la bonne extension pour que Telegram détecte le type
+                _ext_map = {
+                    "video/mp4": "mp4", "video/quicktime": "mov",
+                    "video/x-matroska": "mkv", "video/webm": "webm",
+                    "video/avi": "avi", "video/3gpp": "3gp",
+                    "image/jpeg": "jpg", "image/png": "png",
+                    "image/gif": "gif", "image/webp": "webp",
+                }
+                if is_video:
+                    ext = _ext_map.get(mime, "mp4")
+                    file_io = BytesIO(media_bytes)
+                    file_io.name = f"video.{ext}"
+                    kwargs = dict(file=file_io, caption=caption, force_document=False)
+                elif is_gif:
+                    file_io = BytesIO(media_bytes)
+                    file_io.name = "animation.gif"
+                    kwargs = dict(file=file_io, caption=caption, force_document=False)
+                elif is_image:
+                    ext = _ext_map.get(mime, "jpg")
+                    file_io = BytesIO(media_bytes)
+                    file_io.name = f"photo.{ext}"
+                    kwargs = dict(file=file_io, caption=caption, force_document=False)
+                else:
+                    # Autre document (PDF, zip…) → garder comme fichier
+                    raw_ext = mime.split("/")[-1] if "/" in mime else "bin"
+                    file_io = BytesIO(media_bytes)
+                    file_io.name = f"file.{raw_ext}"
+                    kwargs = dict(file=file_io, caption=caption, force_document=True)
             else:
                 return False
 
