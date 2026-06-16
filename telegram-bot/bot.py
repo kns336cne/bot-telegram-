@@ -36,7 +36,7 @@ from telethon.tl.types import (
 )
 
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -248,38 +248,43 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
             return False
 
         async with UPLOAD_SEMAPHORE:
+            _ext_map = {
+                "video/mp4": "mp4", "video/quicktime": "mov",
+                "video/x-matroska": "mkv", "video/webm": "webm",
+                "video/avi": "avi", "video/3gpp": "3gp",
+                "image/jpeg": "jpg", "image/png": "png",
+                "image/gif": "gif", "image/webp": "webp",
+            }
+
             if isinstance(message.media, MessageMediaPhoto):
-                # Photo → toujours envoyé comme image (pas comme fichier)
-                file_io = BytesIO(media_bytes)
-                file_io.name = "photo.jpg"
-                kwargs = dict(file=file_io, caption=caption, force_document=False)
+                # Photo native Telegram → envoyer les bytes bruts, Telethon détecte JPEG/PNG
+                kwargs = dict(file=media_bytes, caption=caption, force_document=False)
+                logger.debug(f"Envoi PHOTO (bytes bruts, {len(media_bytes)} octets)")
 
             elif isinstance(message.media, MessageMediaDocument):
                 doc = message.media.document
                 mime = doc.mime_type or ""
+                attrs = doc.attributes or []
                 is_video = mime.startswith("video/") or any(
-                    type(attr).__name__ == "DocumentAttributeVideo"
-                    for attr in (doc.attributes or [])
+                    type(a).__name__ == "DocumentAttributeVideo" for a in attrs
                 )
-                is_image = mime.startswith("image/")
                 is_gif = mime == "image/gif" or any(
-                    type(attr).__name__ == "DocumentAttributeAnimated"
-                    for attr in (doc.attributes or [])
+                    type(a).__name__ == "DocumentAttributeAnimated" for a in attrs
                 )
+                is_image = mime.startswith("image/") and not is_gif
 
-                # Choisir la bonne extension pour que Telegram détecte le type
-                _ext_map = {
-                    "video/mp4": "mp4", "video/quicktime": "mov",
-                    "video/x-matroska": "mkv", "video/webm": "webm",
-                    "video/avi": "avi", "video/3gpp": "3gp",
-                    "image/jpeg": "jpg", "image/png": "png",
-                    "image/gif": "gif", "image/webp": "webp",
-                }
+                logger.debug(f"Document reçu: mime={mime!r} is_video={is_video} is_image={is_image} is_gif={is_gif}")
+
                 if is_video:
                     ext = _ext_map.get(mime, "mp4")
                     file_io = BytesIO(media_bytes)
                     file_io.name = f"video.{ext}"
-                    kwargs = dict(file=file_io, caption=caption, force_document=False)
+                    kwargs = dict(
+                        file=file_io,
+                        caption=caption,
+                        force_document=False,
+                        supports_streaming=True,   # ← clé pour afficher inline et pas en fichier
+                    )
                 elif is_gif:
                     file_io = BytesIO(media_bytes)
                     file_io.name = "animation.gif"
@@ -290,7 +295,6 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
                     file_io.name = f"photo.{ext}"
                     kwargs = dict(file=file_io, caption=caption, force_document=False)
                 else:
-                    # Autre document (PDF, zip…) → garder comme fichier
                     raw_ext = mime.split("/")[-1] if "/" in mime else "bin"
                     file_io = BytesIO(media_bytes)
                     file_io.name = f"file.{raw_ext}"
