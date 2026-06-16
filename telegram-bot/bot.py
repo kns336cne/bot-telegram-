@@ -9,6 +9,8 @@ Fonctionnalités :
 - Routage par source : chaque source → sa destination + filtre (photo/vidéo/tout)
 - Transfert d'albums groupés
 - Récupération de l'historique avec suivi en direct
+- Wizard interactif : commandes en étapes (style Discord)
+- /cleardest : vider un canal de réception
 """
 
 import asyncio
@@ -35,6 +37,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.functions.channels import DeleteMessagesRequest
 from telethon.tl.functions.messages import (
     CheckChatInviteRequest,
     GetHistoryRequest,
@@ -57,11 +60,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MediaBot")
 
-API_ID    = int(os.environ["API_ID"])
-API_HASH  = os.environ["API_HASH"]
+API_ID         = int(os.environ["API_ID"])
+API_HASH       = os.environ["API_HASH"]
 SESSION_STRING = os.environ.get("SESSION_STRING", "")
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-OWNER_ID  = int(os.environ["OWNER_ID"])
+BOT_TOKEN      = os.environ["BOT_TOKEN"]
+OWNER_ID       = int(os.environ["OWNER_ID"])
 
 DATA_FILE = "bot_data.json"
 
@@ -70,13 +73,15 @@ DOWNLOAD_SEMAPHORE = asyncio.Semaphore(8)
 
 _seen_messages: set[tuple[int, int]] = set()
 
-# Cache entités : channel_id → entity
 _entity_cache: dict[int, object] = {}
 
-# Buffer albums : grouped_id → [(message, source_name, chat_id)]
 _album_buffer: dict[int, list] = {}
 _album_flush_tasks: dict[int, asyncio.Task] = {}
 ALBUM_WAIT = 0.8
+
+# ── État des wizards ──────────────────────────────────────────────────────────
+# user_id → {"action": str, "step": int, "data": dict}
+_user_states: dict[int, dict] = {}
 
 user_client: TelegramClient = None
 bot_client:  TelegramClient = None
@@ -84,16 +89,84 @@ bot_client:  TelegramClient = None
 
 # ── Données persistantes ──────────────────────────────────────────────────────
 
+_GH_OWNER    = "kns336cne"
+_GH_REPO     = "bot-telegram-"
+_GH_DATA_PATH = "telegram-bot/bot_data.json"
+_last_github_push: float = 0.0
+_PUSH_INTERVAL = 30.0  # secondes minimum entre deux pushes GitHub
+
+
+def _github_headers() -> dict:
+    token = os.environ.get("GITHUB_TOKEN", "")
+    return {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+
+
+def _fetch_data_from_github() -> dict | None:
+    """Télécharge bot_data.json depuis GitHub. Retourne le dict ou None."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return None
+    import base64, urllib.request, urllib.error
+    url = f"https://api.github.com/repos/{_GH_OWNER}/{_GH_REPO}/contents/{_GH_DATA_PATH}"
+    try:
+        req = urllib.request.Request(url, headers=_github_headers())
+        with urllib.request.urlopen(req) as r:
+            resp = json.loads(r.read())
+        content = base64.b64decode(resp["content"]).decode()
+        data_dict = json.loads(content)
+        logger.info("Données rechargées depuis GitHub (persistance entre redémarrages)")
+        return data_dict
+    except Exception as e:
+        logger.info(f"Pas de données GitHub disponibles ({e}), démarrage à vide.")
+        return None
+
+
+def _push_data_to_github(payload_dict: dict):
+    """Pousse bot_data.json vers GitHub (synchrone, non bloquant si erreur)."""
+    global _last_github_push
+    import time
+    now = time.time()
+    if now - _last_github_push < _PUSH_INTERVAL:
+        return
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return
+    import base64, urllib.request, urllib.error
+    url = f"https://api.github.com/repos/{_GH_OWNER}/{_GH_REPO}/contents/{_GH_DATA_PATH}"
+    try:
+        content_b64 = base64.b64encode(json.dumps(payload_dict, indent=2).encode()).decode()
+        req = urllib.request.Request(url, headers=_github_headers())
+        try:
+            with urllib.request.urlopen(req) as r:
+                existing = json.loads(r.read())
+            sha = existing.get("sha")
+        except urllib.error.HTTPError:
+            sha = None
+        body = {"message": "Auto-sync bot_data.json", "content": content_b64}
+        if sha:
+            body["sha"] = sha
+        req2 = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers=_github_headers(), method="PUT"
+        )
+        with urllib.request.urlopen(req2) as r:
+            pass
+        _last_github_push = now
+        logger.info("bot_data.json synchronisé vers GitHub")
+    except Exception as e:
+        logger.warning(f"Sync GitHub bot_data.json échoué (non bloquant): {e}")
+
+
 class BotData:
     def __init__(self):
         self.source_channels: list[dict] = []
-        # Nouveau : liste de canaux de réception
         self.destination_channels: list[dict] = []
-        # Ancien champ (rétro-compatibilité) — pointe sur destination_channels[0]
         self.destination: str | None = None
         self.destination_id: int | None = None
-        # Règles de routage : source_id → dest_id + filtre
-        # {"source_id": int, "dest_id": int, "filter": "all"|"photo"|"video"}
         self.routes: list[dict] = []
         self.paused: bool = False
         self.stats: dict = {"today": 0, "total": 0, "date": str(datetime.now().date())}
@@ -102,60 +175,80 @@ class BotData:
         self._load()
 
     def _load(self):
+        # 1. Essai fichier local
+        raw = None
         if os.path.exists(DATA_FILE):
             try:
                 with open(DATA_FILE, "r") as f:
                     raw = json.load(f)
-                self.source_channels      = raw.get("source_channels", [])
-                self.destination_channels = raw.get("destination_channels", [])
-                self.destination          = raw.get("destination")
-                self.destination_id       = raw.get("destination_id")
-                self.routes               = raw.get("routes", [])
-                self.paused               = raw.get("paused", False)
-                self.stats                = raw.get("stats", self.stats)
-                self.history_ids          = set(raw.get("history_ids", []))
-                self.invite_cache         = raw.get("invite_cache", {})
-
-                # Migration : si ancien destination_id présent mais pas de destination_channels
-                if self.destination_id and not self.destination_channels:
-                    self.destination_channels = [{
-                        "id":   self.destination_id,
-                        "name": self.destination or str(self.destination_id),
-                        "link": self.destination or "",
-                    }]
-
-                logger.info(
-                    f"Données chargées: {len(self.source_channels)} sources, "
-                    f"{len(self.destination_channels)} destinations, "
-                    f"{len(self.routes)} règles"
-                )
+                logger.info("Données chargées depuis le fichier local.")
             except Exception as e:
-                logger.error(f"Erreur chargement données: {e}")
+                logger.error(f"Erreur lecture fichier local: {e}")
+
+        # 2. Si pas de fichier local → essai GitHub
+        if raw is None:
+            raw = _fetch_data_from_github()
+            if raw:
+                # Sauvegarder localement pour les prochains accès
+                try:
+                    with open(DATA_FILE, "w") as f:
+                        json.dump(raw, f, indent=2)
+                except Exception:
+                    pass
+
+        if raw is None:
+            logger.info("Aucune donnée trouvée — démarrage avec configuration vide.")
+            return
+
+        self.source_channels      = raw.get("source_channels", [])
+        self.destination_channels = raw.get("destination_channels", [])
+        self.destination          = raw.get("destination")
+        self.destination_id       = raw.get("destination_id")
+        self.routes               = raw.get("routes", [])
+        self.paused               = raw.get("paused", False)
+        self.stats                = raw.get("stats", self.stats)
+        self.history_ids          = set(raw.get("history_ids", []))
+        self.invite_cache         = raw.get("invite_cache", {})
+
+        if self.destination_id and not self.destination_channels:
+            self.destination_channels = [{
+                "id":   self.destination_id,
+                "name": self.destination or str(self.destination_id),
+                "link": self.destination or "",
+            }]
+
+        logger.info(
+            f"Données chargées: {len(self.source_channels)} sources, "
+            f"{len(self.destination_channels)} destinations, "
+            f"{len(self.routes)} règles"
+        )
+
+    def _payload(self) -> dict:
+        return {
+            "source_channels":      self.source_channels,
+            "destination_channels": self.destination_channels,
+            "destination":          self.destination,
+            "destination_id":       self.destination_id,
+            "routes":               self.routes,
+            "paused":               self.paused,
+            "stats":                self.stats,
+            "history_ids":          list(self.history_ids),
+            "invite_cache":         self.invite_cache,
+        }
 
     def save(self):
-        # Sync ancien champ pour rétro-compatibilité
         if self.destination_channels:
             self.destination    = self.destination_channels[0].get("link")
             self.destination_id = self.destination_channels[0].get("id")
+        payload = self._payload()
+        # Sauvegarde locale
         try:
             with open(DATA_FILE, "w") as f:
-                json.dump(
-                    {
-                        "source_channels":      self.source_channels,
-                        "destination_channels": self.destination_channels,
-                        "destination":          self.destination,
-                        "destination_id":       self.destination_id,
-                        "routes":               self.routes,
-                        "paused":               self.paused,
-                        "stats":                self.stats,
-                        "history_ids":          list(self.history_ids),
-                        "invite_cache":         self.invite_cache,
-                    },
-                    f,
-                    indent=2,
-                )
+                json.dump(payload, f, indent=2)
         except Exception as e:
-            logger.error(f"Erreur sauvegarde: {e}")
+            logger.error(f"Erreur sauvegarde locale: {e}")
+        # Sync GitHub (avec debounce)
+        _push_data_to_github(payload)
 
     def reset_stats_if_new_day(self):
         today = str(datetime.now().date())
@@ -170,14 +263,10 @@ class BotData:
         self.stats["total"] = self.stats.get("total", 0) + count
         self.save()
 
-    # ── Routage ──────────────────────────────────────────────────────────────
-
     def get_routes_for_source(self, source_id: int) -> list[dict]:
-        """Retourne toutes les règles qui s'appliquent à ce canal source."""
         return [r for r in self.routes if r["source_id"] == source_id]
 
     def get_default_dest(self) -> dict | None:
-        """Destination par défaut (première de la liste)."""
         return self.destination_channels[0] if self.destination_channels else None
 
     def get_dest_by_id(self, dest_id: int) -> dict | None:
@@ -187,21 +276,20 @@ class BotData:
 data = BotData()
 
 
-# ── Extension d'une map MIME ──────────────────────────────────────────────────
+# ── Map MIME ──────────────────────────────────────────────────────────────────
 
 _EXT_MAP = {
-    "video/mp4": "mp4",       "video/quicktime": "mov",
-    "video/x-matroska": "mkv","video/webm": "webm",
-    "video/avi": "avi",       "video/3gpp": "3gp",
-    "image/jpeg": "jpg",      "image/png": "png",
-    "image/gif": "gif",       "image/webp": "webp",
+    "video/mp4": "mp4",        "video/quicktime": "mov",
+    "video/x-matroska": "mkv", "video/webm": "webm",
+    "video/avi": "avi",        "video/3gpp": "3gp",
+    "image/jpeg": "jpg",       "image/png": "png",
+    "image/gif": "gif",        "image/webp": "webp",
 }
 
 
 # ── Helpers médias ────────────────────────────────────────────────────────────
 
 def _get_media_kind(message) -> str:
-    """Retourne 'photo', 'video', 'gif', 'image' ou 'other'."""
     if isinstance(message.media, MessageMediaPhoto):
         return "photo"
     if isinstance(message.media, MessageMediaDocument):
@@ -219,7 +307,6 @@ def _get_media_kind(message) -> str:
 
 
 def _filter_matches(media_kind: str, route_filter: str) -> bool:
-    """Vérifie si un média correspond au filtre d'une règle."""
     if route_filter == "all":
         return True
     if route_filter == "photo":
@@ -230,9 +317,6 @@ def _filter_matches(media_kind: str, route_filter: str) -> bool:
 
 
 def _media_to_file(message, media_bytes: bytes):
-    """Prépare (file_obj, extra_kwargs) pour send_file selon le type de média.
-    Retourne (None, None) si type non supporté.
-    """
     if isinstance(message.media, MessageMediaPhoto):
         bio = BytesIO(media_bytes)
         bio.name = "photo.jpg"
@@ -276,7 +360,6 @@ def _media_to_file(message, media_bytes: bytes):
 # ── Cache entités ─────────────────────────────────────────────────────────────
 
 async def get_entity_cached(channel_id: int):
-    """Retourne l'entité Telethon depuis le cache ou via get_entity()."""
     if channel_id in _entity_cache:
         return _entity_cache[channel_id]
     try:
@@ -295,12 +378,28 @@ def invalidate_entity_cache(channel_id: int | None = None):
         _entity_cache.pop(channel_id, None)
 
 
+# ── Wizard : gestion des états ────────────────────────────────────────────────
+
+def state_set(user_id: int, action: str, step: int = 1, data_: dict = None):
+    _user_states[user_id] = {"action": action, "step": step, "data": data_ or {}}
+
+def state_get(user_id: int) -> dict | None:
+    return _user_states.get(user_id)
+
+def state_clear(user_id: int):
+    _user_states.pop(user_id, None)
+
+def state_next(user_id: int, extra: dict = None):
+    s = _user_states.get(user_id)
+    if s:
+        s["step"] += 1
+        if extra:
+            s["data"].update(extra)
+
+
 # ── Résolution de canal ───────────────────────────────────────────────────────
 
 async def resolve_channel(identifier: str):
-    """
-    Résout un canal depuis un lien public, username ou lien d'invitation privé.
-    """
     identifier = identifier.strip()
     if "t.me/" in identifier:
         identifier = identifier.split("t.me/")[-1].strip("/")
@@ -378,14 +477,13 @@ async def resolve_channel(identifier: str):
             raise ValueError(f"Impossible de résoudre le canal `{identifier}`: {e}")
 
 
-# ── Envoi d'un média vers une destination ────────────────────────────────────
+# ── Envoi d'un média ──────────────────────────────────────────────────────────
 
 async def send_media_to_destination(
     message,
     dest_id: int,
     caption_override: str = None,
 ) -> bool:
-    """Télécharge et renvoie un média vers la destination donnée."""
     dest_entity = await get_entity_cached(dest_id)
     if not dest_entity:
         logger.warning(f"Destination id={dest_id} introuvable")
@@ -432,7 +530,7 @@ async def send_media_to_destination(
         return False
 
 
-# ── Envoi d'un album vers une destination ────────────────────────────────────
+# ── Envoi d'un album ──────────────────────────────────────────────────────────
 
 async def send_album_to_destination(
     messages: list,
@@ -440,12 +538,10 @@ async def send_album_to_destination(
     dest_id: int,
     media_filter: str = "all",
 ) -> int:
-    """Télécharge et envoie un album filtré par type vers la destination donnée."""
     dest_entity = await get_entity_cached(dest_id)
     if not dest_entity:
         return 0
 
-    # Filtrer les messages selon le type
     filtered = [m for m in messages if _filter_matches(_get_media_kind(m), media_filter)]
     if not filtered:
         return 0
@@ -495,13 +591,9 @@ async def send_album_to_destination(
             return count
 
 
-# ── Routage d'un message individuel ──────────────────────────────────────────
+# ── Routage ───────────────────────────────────────────────────────────────────
 
 async def route_and_send(message, source_id: int, source_name: str, caption: str) -> int:
-    """
-    Détermine la/les destinations selon les règles, filtre le type de média,
-    envoie et retourne le nombre d'envois réussis.
-    """
     media_kind = _get_media_kind(message)
     routes     = data.get_routes_for_source(source_id)
     sent       = 0
@@ -514,7 +606,6 @@ async def route_and_send(message, source_id: int, source_name: str, caption: str
             if ok:
                 sent += 1
     else:
-        # Pas de règle : utilise la destination par défaut
         default = data.get_default_dest()
         if default:
             ok = await send_media_to_destination(message, default["id"], caption)
@@ -525,7 +616,6 @@ async def route_and_send(message, source_id: int, source_name: str, caption: str
 
 
 async def route_and_send_album(messages: list, source_id: int, source_name: str) -> int:
-    """Routage et envoi d'un album groupé."""
     routes = data.get_routes_for_source(source_id)
     sent   = 0
 
@@ -586,7 +676,7 @@ async def flush_album(grouped_id: int):
         )
 
 
-# ── Traitement de la file d'historique ───────────────────────────────────────
+# ── File d'historique ─────────────────────────────────────────────────────────
 
 def _progress_bar(done: int, total: int, width: int = 16) -> str:
     if total == 0:
@@ -601,18 +691,18 @@ async def process_message_queue(
     source_name: str = "",
     progress_callback=None,
 ) -> tuple[int, int]:
-    BATCH_SIZE = 8
-    sent       = 0
-    failed     = 0
+    BATCH_SIZE  = 8
+    sent        = 0
+    failed      = 0
     last_update = 0.0
 
     media_messages = [
         m for m in messages
         if m.media and isinstance(m.media, (MessageMediaPhoto, MessageMediaDocument))
     ]
-    total = len(media_messages)
-    logger.info(f"Traitement de {total} médias depuis {source_name}")
+    total      = len(media_messages)
     start_time = asyncio.get_event_loop().time()
+    logger.info(f"Traitement de {total} médias depuis {source_name}")
 
     async def send_and_report(msg):
         nonlocal sent, failed, last_update
@@ -655,7 +745,7 @@ async def process_message_queue(
     return sent, failed
 
 
-# ── Utilitaires bot ───────────────────────────────────────────────────────────
+# ── Utilitaires ───────────────────────────────────────────────────────────────
 
 def is_owner(sender_id: int) -> bool:
     return sender_id == OWNER_ID
@@ -666,6 +756,30 @@ async def notify_owner(text: str):
         await bot_client.send_message(OWNER_ID, text, parse_mode="md")
     except Exception as e:
         logger.error(f"Impossible de notifier le propriétaire: {e}")
+
+
+def _fmt_sources() -> str:
+    if not data.source_channels:
+        return "_(aucune source configurée)_"
+    return "\n".join(f"  **{i}.** {ch['name']}" for i, ch in enumerate(data.source_channels, 1))
+
+
+def _fmt_destinations() -> str:
+    if not data.destination_channels:
+        return "_(aucune destination configurée)_"
+    return "\n".join(f"  **{i}.** {d['name']}" for i, d in enumerate(data.destination_channels, 1))
+
+
+def _fmt_routes() -> str:
+    if not data.routes:
+        return "_(aucune règle)_"
+    fl = {"all": "Tout", "photo": "Photos", "video": "Vidéos"}
+    lines = []
+    for i, r in enumerate(data.routes, 1):
+        s = next((c["name"] for c in data.source_channels if c["id"] == r["source_id"]), "?")
+        d = next((x["name"] for x in data.destination_channels if x["id"] == r["dest_id"]), "?")
+        lines.append(f"  **{i}.** {s} → {d} ({fl.get(r['filter'], r['filter'])})")
+    return "\n".join(lines)
 
 
 # ── Handler nouveaux messages (user_client) ───────────────────────────────────
@@ -695,7 +809,6 @@ def setup_user_handlers():
                 str(chat_id),
             )
 
-            # ── Album ─────────────────────────────────────────────────────
             if msg.grouped_id:
                 gid = msg.grouped_id
                 if gid not in _album_buffer:
@@ -706,7 +819,6 @@ def setup_user_handlers():
                 _album_flush_tasks[gid] = asyncio.create_task(flush_album(gid))
                 return
 
-            # ── Média seul ────────────────────────────────────────────────
             msg_key = (chat_id, msg.id)
             if msg_key in _seen_messages:
                 return
@@ -724,7 +836,7 @@ def setup_user_handlers():
             caption_parts.append(f"📅 {now_paris().strftime('%d/%m/%Y à %H:%M')}")
             caption = "\n".join(caption_parts)
 
-            count = await route_and_send(msg, chat_id, source_name, caption)
+            count      = await route_and_send(msg, chat_id, source_name, caption)
             media_type = "📸 Photo" if isinstance(msg.media, MessageMediaPhoto) else "🎬 Vidéo"
 
             if count > 0:
@@ -747,17 +859,331 @@ def setup_user_handlers():
 def setup_bot_handlers():
     OWN = [OWNER_ID]
 
+    # ════════════════════════════════════════════════════════════════════════════
+    # Wizard : handler catch-all — intercepte les réponses aux étapes
+    # ════════════════════════════════════════════════════════════════════════════
+    @bot_client.on(events.NewMessage(incoming=True, from_users=OWN))
+    async def wizard_handler(event):
+        text = (event.raw_text or "").strip()
+
+        # Ignorer les commandes (traitées par leurs propres handlers)
+        if text.startswith("/"):
+            return
+
+        state = state_get(OWNER_ID)
+        if not state:
+            return
+
+        action = state["action"]
+        step   = state["step"]
+        sdata  = state["data"]
+
+        # ── Annuler à tout moment ─────────────────────────────────────────────
+        if text.lower() in ("annuler", "cancel", "stop"):
+            state_clear(OWNER_ID)
+            await event.respond("❌ Action annulée.")
+            return
+
+        try:
+
+            # ──────────────────────────────────────────────────────────────────
+            # AJOUTER SOURCE
+            # ──────────────────────────────────────────────────────────────────
+            if action == "add_canal":
+                # step 1 : lien du canal
+                try:
+                    entity       = await resolve_channel(text)
+                    channel_id   = entity.id
+                    channel_name = getattr(entity, "title", text)
+                except ValueError as e:
+                    await event.respond(f"❌ {e}\n\n🔗 Renvoie le lien, ou tape `annuler`.")
+                    return
+
+                if any(ch["id"] == channel_id for ch in data.source_channels):
+                    state_clear(OWNER_ID)
+                    await event.respond(f"⚠️ **{channel_name}** est déjà dans la liste.")
+                    return
+
+                data.source_channels.append({"id": channel_id, "name": channel_name, "link": text})
+                data.save()
+                num = len(data.source_channels)
+                state_clear(OWNER_ID)
+                await event.respond(
+                    f"✅ Source ajoutée (**n°{num}**) : **{channel_name}**\n\n"
+                    f"💡 Configure le routage avec `/setroute`"
+                )
+
+            # ──────────────────────────────────────────────────────────────────
+            # SUPPRIMER SOURCE
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "remove_canal":
+                try:
+                    num = int(text) - 1
+                except ValueError:
+                    await event.respond("❌ Envoie un **numéro** valide, ou tape `annuler`.")
+                    return
+
+                if 0 <= num < len(data.source_channels):
+                    removed   = data.source_channels.pop(num)
+                    before    = len(data.routes)
+                    data.routes = [r for r in data.routes if r["source_id"] != removed["id"]]
+                    removed_routes = before - len(data.routes)
+                    data.save()
+                    state_clear(OWNER_ID)
+                    msg = f"🗑️ Source supprimée : **{removed['name']}**"
+                    if removed_routes:
+                        msg += f"\n⚠️ {removed_routes} règle(s) associée(s) supprimée(s)."
+                    await event.respond(msg)
+                else:
+                    await event.respond(
+                        f"❌ Numéro invalide (1–{len(data.source_channels)}).\n"
+                        f"Réessaie ou tape `annuler`."
+                    )
+
+            # ──────────────────────────────────────────────────────────────────
+            # AJOUTER DESTINATION
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "add_destination":
+                try:
+                    entity       = await resolve_channel(text)
+                    channel_id   = entity.id
+                    channel_name = getattr(entity, "title", text)
+                except ValueError as e:
+                    await event.respond(f"❌ {e}\n\n🔗 Renvoie le lien, ou tape `annuler`.")
+                    return
+
+                if any(d["id"] == channel_id for d in data.destination_channels):
+                    state_clear(OWNER_ID)
+                    await event.respond(f"⚠️ **{channel_name}** est déjà dans les destinations.")
+                    return
+
+                data.destination_channels.append({"id": channel_id, "name": channel_name, "link": text})
+                _entity_cache[channel_id] = entity
+                data.save()
+                num = len(data.destination_channels)
+                state_clear(OWNER_ID)
+                await event.respond(
+                    f"✅ Destination ajoutée (**n°{num}**) : **{channel_name}**\n\n"
+                    f"💡 Crée une règle avec `/setroute`"
+                )
+
+            # ──────────────────────────────────────────────────────────────────
+            # SUPPRIMER DESTINATION
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "remove_destination":
+                try:
+                    num = int(text) - 1
+                except ValueError:
+                    await event.respond("❌ Envoie un **numéro** valide, ou tape `annuler`.")
+                    return
+
+                if 0 <= num < len(data.destination_channels):
+                    removed = data.destination_channels.pop(num)
+                    invalidate_entity_cache(removed["id"])
+                    before = len(data.routes)
+                    data.routes = [r for r in data.routes if r["dest_id"] != removed["id"]]
+                    removed_routes = before - len(data.routes)
+                    data.save()
+                    state_clear(OWNER_ID)
+                    msg = f"🗑️ Destination supprimée : **{removed['name']}**"
+                    if removed_routes:
+                        msg += f"\n⚠️ {removed_routes} règle(s) associée(s) supprimée(s)."
+                    await event.respond(msg)
+                else:
+                    await event.respond(
+                        f"❌ Numéro invalide (1–{len(data.destination_channels)}).\n"
+                        f"Réessaie ou tape `annuler`."
+                    )
+
+            # ──────────────────────────────────────────────────────────────────
+            # SETROUTE — étape 1 : numéro source
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "set_route" and step == 1:
+                try:
+                    num = int(text) - 1
+                except ValueError:
+                    await event.respond("❌ Envoie un **numéro** valide, ou tape `annuler`.")
+                    return
+
+                if 0 <= num < len(data.source_channels):
+                    src = data.source_channels[num]
+                    state_next(OWNER_ID, {"src_num": num, "src": src})
+                    await event.respond(
+                        f"✅ Source : **{src['name']}**\n\n"
+                        f"📬 **Destinations disponibles :**\n{_fmt_destinations()}\n\n"
+                        f"👇 Envoie le **numéro** de la destination"
+                    )
+                else:
+                    await event.respond(
+                        f"❌ Numéro invalide (1–{len(data.source_channels)}).\n"
+                        f"Réessaie ou tape `annuler`."
+                    )
+
+            # ──────────────────────────────────────────────────────────────────
+            # SETROUTE — étape 2 : numéro destination
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "set_route" and step == 2:
+                try:
+                    num = int(text) - 1
+                except ValueError:
+                    await event.respond("❌ Envoie un **numéro** valide, ou tape `annuler`.")
+                    return
+
+                if 0 <= num < len(data.destination_channels):
+                    dest = data.destination_channels[num]
+                    state_next(OWNER_ID, {"dest_num": num, "dest": dest})
+                    await event.respond(
+                        f"✅ Destination : **{dest['name']}**\n\n"
+                        f"🔍 **Quel type de média envoyer ?**\n"
+                        f"  📷  `photo` — photos uniquement\n"
+                        f"  🎬  `video` — vidéos uniquement\n"
+                        f"  ✨  `tout`  — photos + vidéos\n\n"
+                        f"👇 Tape `photo`, `video` ou `tout`"
+                    )
+                else:
+                    await event.respond(
+                        f"❌ Numéro invalide (1–{len(data.destination_channels)}).\n"
+                        f"Réessaie ou tape `annuler`."
+                    )
+
+            # ──────────────────────────────────────────────────────────────────
+            # SETROUTE — étape 3 : filtre
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "set_route" and step == 3:
+                filtre = text.lower()
+                if filtre in ("tout", "all"):
+                    filtre = "all"
+                if filtre not in ("photo", "video", "all"):
+                    await event.respond(
+                        "❌ Tape `photo`, `video` ou `tout`, ou tape `annuler`."
+                    )
+                    return
+
+                src  = sdata["src"]
+                dest = sdata["dest"]
+
+                existing = next(
+                    (r for r in data.routes
+                     if r["source_id"] == src["id"] and r["dest_id"] == dest["id"]),
+                    None,
+                )
+                if existing:
+                    existing["filter"] = filtre
+                    action_word = "mise à jour"
+                else:
+                    data.routes.append({"source_id": src["id"], "dest_id": dest["id"], "filter": filtre})
+                    action_word = "créée"
+
+                data.save()
+                state_clear(OWNER_ID)
+                fl = {"all": "📷🎬 Tout", "photo": "📷 Photos uniquement", "video": "🎬 Vidéos uniquement"}
+                await event.respond(
+                    f"✅ Règle {action_word} !\n\n"
+                    f"📡 Source : **{src['name']}**\n"
+                    f"➡️ Destination : **{dest['name']}**\n"
+                    f"🔍 Filtre : {fl[filtre]}"
+                )
+
+            # ──────────────────────────────────────────────────────────────────
+            # SUPPRIMER ROUTE
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "remove_route":
+                try:
+                    num = int(text) - 1
+                except ValueError:
+                    await event.respond("❌ Envoie un **numéro** valide, ou tape `annuler`.")
+                    return
+
+                if 0 <= num < len(data.routes):
+                    route     = data.routes.pop(num)
+                    src_info  = next((c["name"] for c in data.source_channels if c["id"] == route["source_id"]), "?")
+                    dest_info = next((d["name"] for d in data.destination_channels if d["id"] == route["dest_id"]), "?")
+                    data.save()
+                    state_clear(OWNER_ID)
+                    await event.respond(f"🗑️ Règle supprimée : **{src_info}** → **{dest_info}**")
+                else:
+                    await event.respond(
+                        f"❌ Numéro invalide (1–{len(data.routes)}).\n"
+                        f"Réessaie ou tape `annuler`."
+                    )
+
+            # ──────────────────────────────────────────────────────────────────
+            # GETHISTORY — étape 1 : lien du canal
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "get_history":
+                state_clear(OWNER_ID)
+                await _do_gethistory(event, text)
+
+            # ──────────────────────────────────────────────────────────────────
+            # CLEARDEST — étape 1 : numéro de destination
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "clear_dest" and step == 1:
+                try:
+                    num = int(text) - 1
+                except ValueError:
+                    await event.respond("❌ Envoie un **numéro** valide, ou tape `annuler`.")
+                    return
+
+                if 0 <= num < len(data.destination_channels):
+                    dest = data.destination_channels[num]
+                    state_next(OWNER_ID, {"dest": dest})
+                    await event.respond(
+                        f"⚠️ **Tu vas supprimer TOUS les messages de :**\n\n"
+                        f"📬 **{dest['name']}**\n\n"
+                        f"Cette action est **irréversible**.\n"
+                        f"Tape `oui` pour confirmer, ou `annuler` pour abandonner."
+                    )
+                else:
+                    await event.respond(
+                        f"❌ Numéro invalide (1–{len(data.destination_channels)}).\n"
+                        f"Réessaie ou tape `annuler`."
+                    )
+
+            # ──────────────────────────────────────────────────────────────────
+            # CLEARDEST — étape 2 : confirmation
+            # ──────────────────────────────────────────────────────────────────
+            elif action == "clear_dest" and step == 2:
+                if text.lower() not in ("oui", "yes", "o"):
+                    state_clear(OWNER_ID)
+                    await event.respond("❌ Action annulée. Aucun message supprimé.")
+                    return
+
+                dest       = sdata["dest"]
+                state_clear(OWNER_ID)
+                status_msg = await event.respond(
+                    f"🗑️ Suppression en cours dans **{dest['name']}**...\n⏳ Patiente..."
+                )
+                await _do_cleardest(status_msg, dest)
+
+        except Exception as e:
+            logger.error(f"Erreur wizard (action={action}, step={step}): {e}")
+            state_clear(OWNER_ID)
+            await event.respond(f"❌ Erreur inattendue : {e}")
+
+    # ════════════════════════════════════════════════════════════════════════════
+    # Commandes
+    # ════════════════════════════════════════════════════════════════════════════
+
+    # ── /annuler ──────────────────────────────────────────────────────────────
+    @bot_client.on(events.NewMessage(pattern=r"^/annuler(@\w+)?$", incoming=True, from_users=OWN))
+    async def cmd_annuler(event):
+        if state_get(OWNER_ID):
+            state_clear(OWNER_ID)
+            await event.respond("❌ Action annulée.")
+        else:
+            await event.respond("ℹ️ Aucune action en cours.")
+
     # ── /start ────────────────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(pattern=r"^/start(@\w+)?$", incoming=True, from_users=OWN))
     async def cmd_start(event):
         await event.respond(
             "🤖 **Bot de transfert de médias**\n\n"
-            "Utilise le menu `/` pour voir toutes les commandes.\n\n"
             "💡 **Démarrage rapide :**\n"
-            "1️⃣ `/addcanal <lien>` — ajouter une source\n"
-            "2️⃣ `/adddestination <lien>` — ajouter une destination\n"
-            "3️⃣ `/setroute <n° source> <n° dest> [photo|video|tout]` — règle de routage\n"
-            "4️⃣ `/routes` — vérifier la configuration"
+            "1️⃣ `/addcanal` — ajouter une source\n"
+            "2️⃣ `/adddestination` — ajouter une destination\n"
+            "3️⃣ `/setroute` — configurer le routage\n"
+            "4️⃣ `/status` — voir la configuration\n\n"
+            "Toutes les commandes fonctionnent **sans argument** — le bot te guide étape par étape !"
         )
 
     # ── /help ─────────────────────────────────────────────────────────────────
@@ -766,89 +1192,104 @@ def setup_bot_handlers():
         await event.respond(
             "🤖 **Commandes disponibles**\n\n"
             "**📡 Sources**\n"
-            "`/addcanal <lien>` — ajouter un canal source\n"
-            "`/removecanal <n°>` — supprimer un canal source\n"
+            "`/addcanal` — ajouter un canal source\n"
+            "`/removecanal` — supprimer un canal source\n"
             "`/canaux` — voir les canaux sources\n\n"
             "**📬 Destinations**\n"
-            "`/adddestination <lien>` — ajouter un canal de réception\n"
-            "`/removedestination <n°>` — supprimer une destination\n"
+            "`/adddestination` — ajouter un canal de réception\n"
+            "`/removedestination` — supprimer une destination\n"
+            "`/cleardest` — 🗑️ vider tous les messages d'une destination\n"
             "`/destinations` — voir les destinations\n\n"
             "**🔀 Routage**\n"
-            "`/setroute <n° source> <n° dest> [photo|video|tout]` — créer une règle\n"
-            "`/removeroute <n°>` — supprimer une règle\n"
+            "`/setroute` — créer une règle source → destination + filtre\n"
+            "`/removeroute` — supprimer une règle\n"
             "`/routes` — voir toutes les règles\n\n"
             "**⚙️ Contrôle**\n"
             "`/pause` — mettre en pause\n"
             "`/resume` — reprendre\n"
-            "`/clear` — effacer l'historique des IDs\n\n"
+            "`/clear` — effacer l'historique des IDs\n"
+            "`/annuler` — annuler l'action en cours\n\n"
             "**📥 Historique**\n"
-            "`/gethistory <lien>` — récupérer tout l'historique\n\n"
+            "`/gethistory` — récupérer tout l'historique d'un canal\n\n"
             "**📊 Infos**\n"
-            "`/status` — état du bot\n"
-            "`/stats` — statistiques\n"
-            "`/help` — cette aide\n\n"
-            "**💡 Exemple de routage :**\n"
-            "• Source 1 (Javana) → Dest 1 : vidéos uniquement\n"
-            "• Source 1 (Javana) → Dest 2 : photos uniquement\n"
-            "• Source 2 (Petit chat) → Dest 1 : tout\n"
-            "→ `/setroute 1 1 video`\n"
-            "→ `/setroute 1 2 photo`\n"
-            "→ `/setroute 2 1 tout`"
+            "`/status` — état complet du bot\n"
+            "`/stats` — statistiques de transfert\n\n"
+            "💡 Toutes les commandes fonctionnent **sans argument** — je te guide étape par étape !"
         )
 
     # ── /addcanal ─────────────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(
-        pattern=r"^/addcanal(@\w+)?\s+(.+)$", incoming=True, from_users=OWN
+        pattern=r"^/addcanal(@\w+)?(\s+.+)?$", incoming=True, from_users=OWN
     ))
     async def cmd_addcanal(event):
-        link = event.pattern_match.group(2).strip()
-        try:
-            entity     = await resolve_channel(link)
-            channel_id = entity.id
-            channel_name = getattr(entity, "title", link)
-            if any(ch["id"] == channel_id for ch in data.source_channels):
-                await event.respond(f"⚠️ **{channel_name}** est déjà dans la liste.")
-                return
-            data.source_channels.append({"id": channel_id, "name": channel_name, "link": link})
-            data.save()
-            num = len(data.source_channels)
+        arg = (event.pattern_match.group(2) or "").strip()
+        if arg:
+            # Appel direct avec argument
+            try:
+                entity       = await resolve_channel(arg)
+                channel_id   = entity.id
+                channel_name = getattr(entity, "title", arg)
+                if any(ch["id"] == channel_id for ch in data.source_channels):
+                    await event.respond(f"⚠️ **{channel_name}** est déjà dans la liste.")
+                    return
+                data.source_channels.append({"id": channel_id, "name": channel_name, "link": arg})
+                data.save()
+                num = len(data.source_channels)
+                await event.respond(
+                    f"✅ Source ajoutée (**n°{num}**) : **{channel_name}**\n\n"
+                    f"💡 Configure le routage avec `/setroute`"
+                )
+            except ValueError as e:
+                await event.respond(f"❌ {e}")
+            except Exception as e:
+                await event.respond(f"❌ Erreur : {e}")
+        else:
+            # Mode wizard
+            state_set(OWNER_ID, "add_canal")
             await event.respond(
-                f"✅ Source ajoutée (**n°{num}**) : **{channel_name}**\n\n"
-                f"💡 Configure le routage avec `/setroute {num} <n° dest> [photo|video|tout]`"
+                "📡 **Ajouter un canal source**\n\n"
+                "👇 Envoie le **lien** du canal\n"
+                "_(ex: `https://t.me/moncanal` ou `@moncanal`)_\n\n"
+                "Tape `annuler` pour abandonner."
             )
-        except ValueError as e:
-            await event.respond(f"❌ {e}")
-        except Exception as e:
-            await event.respond(f"❌ Erreur : {e}")
 
     # ── /removecanal ──────────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(
-        pattern=r"^/removecanal(@\w+)?\s+(\d+)$", incoming=True, from_users=OWN
+        pattern=r"^/removecanal(@\w+)?(\s+\d+)?$", incoming=True, from_users=OWN
     ))
     async def cmd_removecanal(event):
-        num = int(event.pattern_match.group(2)) - 1
-        if 0 <= num < len(data.source_channels):
-            removed   = data.source_channels.pop(num)
-            source_id = removed["id"]
-            # Supprimer les règles liées à cette source
-            before = len(data.routes)
-            data.routes = [r for r in data.routes if r["source_id"] != source_id]
-            removed_routes = before - len(data.routes)
-            data.save()
-            msg = f"🗑️ Source supprimée : **{removed['name']}**"
-            if removed_routes:
-                msg += f"\n⚠️ {removed_routes} règle(s) associée(s) supprimée(s)."
-            await event.respond(msg)
+        arg = (event.pattern_match.group(2) or "").strip()
+        if not data.source_channels:
+            await event.respond("📋 Aucun canal source à supprimer.")
+            return
+        if arg:
+            num = int(arg) - 1
+            if 0 <= num < len(data.source_channels):
+                removed = data.source_channels.pop(num)
+                before  = len(data.routes)
+                data.routes = [r for r in data.routes if r["source_id"] != removed["id"]]
+                removed_routes = before - len(data.routes)
+                data.save()
+                msg = f"🗑️ Source supprimée : **{removed['name']}**"
+                if removed_routes:
+                    msg += f"\n⚠️ {removed_routes} règle(s) associée(s) supprimée(s)."
+                await event.respond(msg)
+            else:
+                await event.respond("❌ Numéro invalide.")
         else:
-            await event.respond("❌ Numéro invalide. Utilise `/canaux` pour voir la liste.")
+            state_set(OWNER_ID, "remove_canal")
+            await event.respond(
+                f"🗑️ **Supprimer un canal source**\n\n"
+                f"📡 **Sources actuelles :**\n{_fmt_sources()}\n\n"
+                f"👇 Envoie le **numéro** à supprimer\n\n"
+                f"Tape `annuler` pour abandonner."
+            )
 
     # ── /canaux ───────────────────────────────────────────────────────────────
-    @bot_client.on(events.NewMessage(
-        pattern=r"^/canaux(@\w+)?$", incoming=True, from_users=OWN
-    ))
+    @bot_client.on(events.NewMessage(pattern=r"^/canaux(@\w+)?$", incoming=True, from_users=OWN))
     async def cmd_canaux(event):
         if not data.source_channels:
-            await event.respond("📋 Aucun canal source.\nUtilise `/addcanal <lien>` pour en ajouter.")
+            await event.respond("📋 Aucun canal source.\nUtilise `/addcanal` pour en ajouter.")
             return
         lines = ["📋 **Canaux sources :**\n"]
         for i, ch in enumerate(data.source_channels, 1):
@@ -857,162 +1298,211 @@ def setup_bot_handlers():
 
     # ── /adddestination ───────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(
-        pattern=r"^/adddestination(@\w+)?\s+(.+)$", incoming=True, from_users=OWN
+        pattern=r"^/adddestination(@\w+)?(\s+.+)?$", incoming=True, from_users=OWN
     ))
     async def cmd_adddestination(event):
-        link = event.pattern_match.group(2).strip()
-        try:
-            entity       = await resolve_channel(link)
-            channel_id   = entity.id
-            channel_name = getattr(entity, "title", link)
-            if any(d["id"] == channel_id for d in data.destination_channels):
-                await event.respond(f"⚠️ **{channel_name}** est déjà dans les destinations.")
-                return
-            data.destination_channels.append({"id": channel_id, "name": channel_name, "link": link})
-            _entity_cache[channel_id] = entity
-            data.save()
-            num = len(data.destination_channels)
+        arg = (event.pattern_match.group(2) or "").strip()
+        if arg:
+            try:
+                entity       = await resolve_channel(arg)
+                channel_id   = entity.id
+                channel_name = getattr(entity, "title", arg)
+                if any(d["id"] == channel_id for d in data.destination_channels):
+                    await event.respond(f"⚠️ **{channel_name}** est déjà dans les destinations.")
+                    return
+                data.destination_channels.append({"id": channel_id, "name": channel_name, "link": arg})
+                _entity_cache[channel_id] = entity
+                data.save()
+                num = len(data.destination_channels)
+                await event.respond(
+                    f"✅ Destination ajoutée (**n°{num}**) : **{channel_name}**\n\n"
+                    f"💡 Crée une règle avec `/setroute`"
+                )
+            except ValueError as e:
+                await event.respond(f"❌ {e}")
+            except Exception as e:
+                await event.respond(f"❌ Erreur : {e}")
+        else:
+            state_set(OWNER_ID, "add_destination")
             await event.respond(
-                f"✅ Destination ajoutée (**n°{num}**) : **{channel_name}**\n\n"
-                f"💡 Crée une règle avec `/setroute <n° source> {num} [photo|video|tout]`"
+                "📬 **Ajouter un canal de réception**\n\n"
+                "👇 Envoie le **lien** du canal\n"
+                "_(ex: `https://t.me/moncanal` ou `@moncanal`)_\n\n"
+                "Tape `annuler` pour abandonner."
             )
-            logger.info(f"Destination ajoutée: {channel_name} ({channel_id})")
-        except ValueError as e:
-            await event.respond(f"❌ {e}")
-        except Exception as e:
-            await event.respond(f"❌ Erreur : {e}")
 
     # ── /removedestination ────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(
-        pattern=r"^/removedestination(@\w+)?\s+(\d+)$", incoming=True, from_users=OWN
+        pattern=r"^/removedestination(@\w+)?(\s+\d+)?$", incoming=True, from_users=OWN
     ))
     async def cmd_removedestination(event):
-        num = int(event.pattern_match.group(2)) - 1
-        if 0 <= num < len(data.destination_channels):
-            removed = data.destination_channels.pop(num)
-            dest_id = removed["id"]
-            invalidate_entity_cache(dest_id)
-            before = len(data.routes)
-            data.routes = [r for r in data.routes if r["dest_id"] != dest_id]
-            removed_routes = before - len(data.routes)
-            data.save()
-            msg = f"🗑️ Destination supprimée : **{removed['name']}**"
-            if removed_routes:
-                msg += f"\n⚠️ {removed_routes} règle(s) associée(s) supprimée(s)."
-            await event.respond(msg)
+        arg = (event.pattern_match.group(2) or "").strip()
+        if not data.destination_channels:
+            await event.respond("📋 Aucune destination à supprimer.")
+            return
+        if arg:
+            num = int(arg) - 1
+            if 0 <= num < len(data.destination_channels):
+                removed = data.destination_channels.pop(num)
+                invalidate_entity_cache(removed["id"])
+                before = len(data.routes)
+                data.routes = [r for r in data.routes if r["dest_id"] != removed["id"]]
+                removed_routes = before - len(data.routes)
+                data.save()
+                msg = f"🗑️ Destination supprimée : **{removed['name']}**"
+                if removed_routes:
+                    msg += f"\n⚠️ {removed_routes} règle(s) associée(s) supprimée(s)."
+                await event.respond(msg)
+            else:
+                await event.respond("❌ Numéro invalide.")
         else:
-            await event.respond("❌ Numéro invalide. Utilise `/destinations` pour voir la liste.")
+            state_set(OWNER_ID, "remove_destination")
+            await event.respond(
+                f"🗑️ **Supprimer une destination**\n\n"
+                f"📬 **Destinations actuelles :**\n{_fmt_destinations()}\n\n"
+                f"👇 Envoie le **numéro** à supprimer\n\n"
+                f"Tape `annuler` pour abandonner."
+            )
 
     # ── /destinations ─────────────────────────────────────────────────────────
-    @bot_client.on(events.NewMessage(
-        pattern=r"^/destinations(@\w+)?$", incoming=True, from_users=OWN
-    ))
+    @bot_client.on(events.NewMessage(pattern=r"^/destinations(@\w+)?$", incoming=True, from_users=OWN))
     async def cmd_destinations(event):
         if not data.destination_channels:
-            await event.respond(
-                "📋 Aucune destination configurée.\n"
-                "Utilise `/adddestination <lien>` pour en ajouter."
-            )
+            await event.respond("📋 Aucune destination.\nUtilise `/adddestination` pour en ajouter.")
             return
         lines = ["📬 **Canaux de réception :**\n"]
         for i, d_ in enumerate(data.destination_channels, 1):
             lines.append(f"{i}. **{d_['name']}** (`{d_.get('link','?')}`)")
         await event.respond("\n".join(lines))
 
+    # ── /cleardest ────────────────────────────────────────────────────────────
+    @bot_client.on(events.NewMessage(pattern=r"^/cleardest(@\w+)?$", incoming=True, from_users=OWN))
+    async def cmd_cleardest(event):
+        if not data.destination_channels:
+            await event.respond("📋 Aucune destination configurée.")
+            return
+        state_set(OWNER_ID, "clear_dest")
+        await event.respond(
+            f"🗑️ **Vider un canal de réception**\n\n"
+            f"📬 **Destinations disponibles :**\n{_fmt_destinations()}\n\n"
+            f"👇 Envoie le **numéro** du canal à vider\n\n"
+            f"⚠️ Tous les messages seront supprimés définitivement.\n"
+            f"Tape `annuler` pour abandonner."
+        )
+
     # ── /setroute ─────────────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(
-        pattern=r"^/setroute(@\w+)?\s+(\d+)\s+(\d+)(?:\s+(photo|video|tout|all))?$",
-        incoming=True, from_users=OWN
+        pattern=r"^/setroute(@\w+)?(\s+\d+\s+\d+(?:\s+\w+)?)?$", incoming=True, from_users=OWN
     ))
     async def cmd_setroute(event):
-        src_num  = int(event.pattern_match.group(2)) - 1
-        dest_num = int(event.pattern_match.group(3)) - 1
-        filtre   = (event.pattern_match.group(4) or "tout").lower()
-        if filtre in ("tout", "all"):
-            filtre = "all"
+        arg = (event.pattern_match.group(2) or "").strip()
+        if arg:
+            # Appel direct : /setroute 1 2 video
+            parts = arg.split()
+            if len(parts) < 2:
+                await event.respond("❌ Usage : `/setroute <n° source> <n° dest> [photo|video|tout]`")
+                return
+            try:
+                src_num  = int(parts[0]) - 1
+                dest_num = int(parts[1]) - 1
+                filtre   = parts[2].lower() if len(parts) > 2 else "all"
+                if filtre in ("tout", "all"):
+                    filtre = "all"
+            except ValueError:
+                await event.respond("❌ Numéros invalides.")
+                return
 
-        if src_num < 0 or src_num >= len(data.source_channels):
-            await event.respond(
-                f"❌ Source n°{src_num+1} inexistante. Utilise `/canaux` pour voir la liste."
+            if src_num < 0 or src_num >= len(data.source_channels):
+                await event.respond(f"❌ Source n°{src_num+1} inexistante.")
+                return
+            if dest_num < 0 or dest_num >= len(data.destination_channels):
+                await event.respond(f"❌ Destination n°{dest_num+1} inexistante.")
+                return
+
+            src  = data.source_channels[src_num]
+            dest = data.destination_channels[dest_num]
+            existing = next(
+                (r for r in data.routes if r["source_id"] == src["id"] and r["dest_id"] == dest["id"]),
+                None,
             )
-            return
-        if dest_num < 0 or dest_num >= len(data.destination_channels):
+            if existing:
+                existing["filter"] = filtre
+                action_word = "mise à jour"
+            else:
+                data.routes.append({"source_id": src["id"], "dest_id": dest["id"], "filter": filtre})
+                action_word = "créée"
+            data.save()
+            fl = {"all": "📷🎬 Tout", "photo": "📷 Photos uniquement", "video": "🎬 Vidéos uniquement"}
             await event.respond(
-                f"❌ Destination n°{dest_num+1} inexistante. Utilise `/destinations` pour voir la liste."
+                f"✅ Règle {action_word} !\n\n"
+                f"📡 Source : **{src['name']}**\n"
+                f"➡️ Destination : **{dest['name']}**\n"
+                f"🔍 Filtre : {fl.get(filtre, filtre)}"
             )
-            return
-
-        src  = data.source_channels[src_num]
-        dest = data.destination_channels[dest_num]
-
-        # Vérifier si une règle identique existe déjà
-        existing = next(
-            (r for r in data.routes
-             if r["source_id"] == src["id"] and r["dest_id"] == dest["id"]),
-            None,
-        )
-        if existing:
-            existing["filter"] = filtre
-            action = "mise à jour"
         else:
-            data.routes.append({"source_id": src["id"], "dest_id": dest["id"], "filter": filtre})
-            action = "créée"
-
-        data.save()
-
-        filtre_label = {"all": "📷🎬 Tout", "photo": "📷 Photos uniquement", "video": "🎬 Vidéos uniquement"}[filtre]
-        await event.respond(
-            f"✅ Règle {action} !\n\n"
-            f"📡 Source : **{src['name']}**\n"
-            f"➡️ Destination : **{dest['name']}**\n"
-            f"🔍 Filtre : {filtre_label}"
-        )
+            # Mode wizard
+            if not data.source_channels:
+                await event.respond("❌ Aucune source. Ajoute-en une avec `/addcanal`.")
+                return
+            if not data.destination_channels:
+                await event.respond("❌ Aucune destination. Ajoute-en une avec `/adddestination`.")
+                return
+            state_set(OWNER_ID, "set_route", step=1)
+            await event.respond(
+                f"🔀 **Créer une règle de routage**\n\n"
+                f"📡 **Sources disponibles :**\n{_fmt_sources()}\n\n"
+                f"👇 Envoie le **numéro** de la source\n\n"
+                f"Tape `annuler` pour abandonner."
+            )
 
     # ── /removeroute ──────────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(
-        pattern=r"^/removeroute(@\w+)?\s+(\d+)$", incoming=True, from_users=OWN
+        pattern=r"^/removeroute(@\w+)?(\s+\d+)?$", incoming=True, from_users=OWN
     ))
     async def cmd_removeroute(event):
-        num = int(event.pattern_match.group(2)) - 1
-        if 0 <= num < len(data.routes):
-            route   = data.routes.pop(num)
-            src_info  = next((c["name"] for c in data.source_channels  if c["id"] == route["source_id"]), str(route["source_id"]))
-            dest_info = next((d["name"] for d in data.destination_channels if d["id"] == route["dest_id"]), str(route["dest_id"]))
-            data.save()
-            await event.respond(f"🗑️ Règle supprimée : **{src_info}** → **{dest_info}**")
+        arg = (event.pattern_match.group(2) or "").strip()
+        if not data.routes:
+            await event.respond("📋 Aucune règle à supprimer.")
+            return
+        if arg:
+            num = int(arg) - 1
+            if 0 <= num < len(data.routes):
+                route     = data.routes.pop(num)
+                src_info  = next((c["name"] for c in data.source_channels if c["id"] == route["source_id"]), "?")
+                dest_info = next((d["name"] for d in data.destination_channels if d["id"] == route["dest_id"]), "?")
+                data.save()
+                await event.respond(f"🗑️ Règle supprimée : **{src_info}** → **{dest_info}**")
+            else:
+                await event.respond("❌ Numéro invalide.")
         else:
-            await event.respond("❌ Numéro invalide. Utilise `/routes` pour voir la liste.")
+            state_set(OWNER_ID, "remove_route")
+            await event.respond(
+                f"🗑️ **Supprimer une règle**\n\n"
+                f"🔀 **Règles actuelles :**\n{_fmt_routes()}\n\n"
+                f"👇 Envoie le **numéro** à supprimer\n\n"
+                f"Tape `annuler` pour abandonner."
+            )
 
     # ── /routes ───────────────────────────────────────────────────────────────
-    @bot_client.on(events.NewMessage(
-        pattern=r"^/routes(@\w+)?$", incoming=True, from_users=OWN
-    ))
+    @bot_client.on(events.NewMessage(pattern=r"^/routes(@\w+)?$", incoming=True, from_users=OWN))
     async def cmd_routes(event):
         if not data.routes:
-            no_route_msg = "📋 Aucune règle de routage.\n\nUtilise `/setroute <n° source> <n° dest> [photo|video|tout]`"
+            msg = "📋 Aucune règle.\n\nUtilise `/setroute` pour en créer une."
             if data.destination_channels:
-                no_route_msg += (
-                    f"\n\n💡 Sans règle, tous les médias vont vers la 1ère destination : "
-                    f"**{data.destination_channels[0]['name']}**"
-                )
-            await event.respond(no_route_msg)
+                msg += f"\n\n💡 Sans règle → **{data.destination_channels[0]['name']}** (tout)"
+            await event.respond(msg)
             return
-
-        filtre_label = {"all": "📷🎬 Tout", "photo": "📷 Photos", "video": "🎬 Vidéos"}
+        fl = {"all": "📷🎬 Tout", "photo": "📷 Photos", "video": "🎬 Vidéos"}
         lines = ["🔀 **Règles de routage :**\n"]
         for i, route in enumerate(data.routes, 1):
-            src_name  = next((c["name"] for c in data.source_channels  if c["id"] == route["source_id"]), f"id:{route['source_id']}")
-            dest_name = next((d["name"] for d in data.destination_channels if d["id"] == route["dest_id"]), f"id:{route['dest_id']}")
-            f_label   = filtre_label.get(route["filter"], route["filter"])
-            lines.append(f"{i}. **{src_name}** → **{dest_name}** ({f_label})")
-
+            s = next((c["name"] for c in data.source_channels if c["id"] == route["source_id"]), f"id:{route['source_id']}")
+            d = next((x["name"] for x in data.destination_channels if x["id"] == route["dest_id"]), f"id:{route['dest_id']}")
+            lines.append(f"{i}. **{s}** → **{d}** ({fl.get(route['filter'], route['filter'])})")
         if data.destination_channels:
-            lines.append(
-                f"\n💡 Sources sans règle → **{data.destination_channels[0]['name']}** (tout)"
-            )
+            lines.append(f"\n💡 Sources sans règle → **{data.destination_channels[0]['name']}** (tout)")
         await event.respond("\n".join(lines))
 
-    # ── /setdestination (rétro-compatibilité) ─────────────────────────────────
+    # ── /setdestination (rétro-compat) ────────────────────────────────────────
     @bot_client.on(events.NewMessage(
         pattern=r"^/setdestination(@\w+)?\s+(.+)$", incoming=True, from_users=OWN
     ))
@@ -1022,7 +1512,6 @@ def setup_bot_handlers():
             entity       = await resolve_channel(link)
             channel_name = getattr(entity, "title", link)
             channel_id   = entity.id
-            # Ajouter si pas encore présent, sinon mettre à jour la 1ère
             if data.destination_channels:
                 data.destination_channels[0] = {"id": channel_id, "name": channel_name, "link": link}
             else:
@@ -1033,7 +1522,6 @@ def setup_bot_handlers():
                 f"✅ Destination par défaut : **{channel_name}**\n\n"
                 f"💡 Tu peux ajouter d'autres destinations avec `/adddestination`"
             )
-            logger.info(f"Destination définie: {channel_name} (id={entity.id})")
         except ValueError as e:
             await event.respond(f"❌ {e}")
         except Exception as e:
@@ -1064,30 +1552,13 @@ def setup_bot_handlers():
     # ── /status ───────────────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(pattern=r"^/status(@\w+)?$", incoming=True, from_users=OWN))
     async def cmd_status(event):
-        state = "⏸️ En pause" if data.paused else "▶️ Actif"
-
-        src_list = "\n".join(
-            f"  {i}. {ch['name']}" for i, ch in enumerate(data.source_channels, 1)
-        ) or "  Aucun"
-
-        dest_list = "\n".join(
-            f"  {i}. {d['name']}" for i, d in enumerate(data.destination_channels, 1)
-        ) or "  Aucune"
-
-        filtre_label = {"all": "Tout", "photo": "Photos", "video": "Vidéos"}
-        routes_list  = "\n".join(
-            f"  {i}. {next((c['name'] for c in data.source_channels if c['id']==r['source_id']), '?')} → "
-            f"{next((d['name'] for d in data.destination_channels if d['id']==r['dest_id']), '?')} "
-            f"({filtre_label.get(r['filter'], r['filter'])})"
-            for i, r in enumerate(data.routes, 1)
-        ) or "  Aucune (→ destination par défaut)"
-
+        state_str = "⏸️ En pause" if data.paused else "▶️ Actif"
         await event.respond(
             f"📊 **État du bot**\n\n"
-            f"État : {state}\n\n"
-            f"📡 **Sources ({len(data.source_channels)}) :**\n{src_list}\n\n"
-            f"📬 **Destinations ({len(data.destination_channels)}) :**\n{dest_list}\n\n"
-            f"🔀 **Règles ({len(data.routes)}) :**\n{routes_list}\n\n"
+            f"État : {state_str}\n\n"
+            f"📡 **Sources ({len(data.source_channels)}) :**\n{_fmt_sources()}\n\n"
+            f"📬 **Destinations ({len(data.destination_channels)}) :**\n{_fmt_destinations()}\n\n"
+            f"🔀 **Règles ({len(data.routes)}) :**\n{_fmt_routes()}\n\n"
             f"🗂 IDs suivis : {len(data.history_ids)}"
         )
 
@@ -1103,164 +1574,222 @@ def setup_bot_handlers():
 
     # ── /gethistory ───────────────────────────────────────────────────────────
     @bot_client.on(events.NewMessage(
-        pattern=r"^/gethistory(@\w+)?(?:\s+(.+))?$", incoming=True, from_users=OWN
+        pattern=r"^/gethistory(@\w+)?(\s+.+)?$", incoming=True, from_users=OWN
     ))
     async def cmd_gethistory(event):
+        arg = (event.pattern_match.group(2) or "").strip()
         if not data.destination_channels:
-            await event.respond(
-                "❌ Aucune destination configurée.\n"
-                "Utilise `/adddestination <lien>` d'abord."
-            )
+            await event.respond("❌ Aucune destination configurée.\nUtilise `/adddestination` d'abord.")
             return
-
-        link_arg    = event.pattern_match.group(2)
-        target_link = (link_arg.strip() if link_arg else None) or (
-            data.source_channels[0]["link"] if data.source_channels else None
-        )
-        if not target_link:
-            await event.respond("❌ Spécifie un canal : `/gethistory @canal`")
-            return
-
-        status_msg = await event.respond("🔍 Connexion au canal en cours...")
-        try:
-            entity = await resolve_channel(target_link)
-        except ValueError as e:
-            await status_msg.edit(f"❌ {e}")
-            return
-
-        source_name = getattr(entity, "title", target_link)
-        source_id   = entity.id
-
-        # Trouver les règles pour cette source
-        routes_for_source = data.get_routes_for_source(source_id)
-        if routes_for_source:
-            dest_names = ", ".join(
-                next((d["name"] for d in data.destination_channels if d["id"] == r["dest_id"]), "?")
-                for r in routes_for_source
-            )
-            route_info = f"🔀 Règles : {len(routes_for_source)} destination(s) ({dest_names})"
+        if arg:
+            await _do_gethistory(event, arg)
         else:
-            default = data.get_default_dest()
-            dest_names = default["name"] if default else "?"
-            route_info = f"📬 Destination par défaut : {dest_names}"
+            # Pré-remplir avec le premier canal source si dispo
+            if data.source_channels and data.source_channels[0].get("link"):
+                hint = f"\n_(ex: `{data.source_channels[0]['link']}`)_"
+            else:
+                hint = "\n_(ex: `@moncanal` ou `https://t.me/moncanal`)_"
+            state_set(OWNER_ID, "get_history")
+            await event.respond(
+                f"📥 **Récupérer l'historique**\n\n"
+                f"👇 Envoie le **lien** du canal source{hint}\n\n"
+                f"Tape `annuler` pour abandonner."
+            )
 
-        all_messages   = []
-        offset_id      = 0
-        total_fetched  = 0
-        last_scan_update = 0.0
 
-        await status_msg.edit(
-            f"📡 **Scan de l'historique**\n"
-            f"📺 Canal : **{source_name}**\n"
-            f"{route_info}\n\n"
-            f"⏳ Récupération des messages..."
-        )
+# ── Logique /cleardest ────────────────────────────────────────────────────────
+
+async def _do_cleardest(status_msg, dest: dict):
+    """Supprime tous les messages du canal de destination donné."""
+    dest_id = dest["id"]
+    try:
+        entity = await get_entity_cached(dest_id)
+        if not entity:
+            await status_msg.edit("❌ Canal introuvable ou accès refusé.")
+            return
+
+        deleted_total = 0
+        batch_size    = 100
 
         while True:
+            msg_ids = []
+            async for msg in user_client.iter_messages(entity, limit=batch_size):
+                msg_ids.append(msg.id)
+
+            if not msg_ids:
+                break
+
             try:
-                history = await user_client(
-                    GetHistoryRequest(
-                        peer=entity, limit=100, offset_date=None,
-                        offset_id=offset_id, max_id=0, min_id=0,
-                        add_offset=0, hash=0,
-                    )
-                )
-            except FloodWaitError as e:
-                await asyncio.sleep(e.seconds + 1)
-                continue
-            except Exception as e:
-                await status_msg.edit(f"❌ Erreur récupération historique : {e}")
-                return
+                await user_client(DeleteMessagesRequest(channel=entity, id=msg_ids))
+            except Exception:
+                # Fallback : suppression message par message
+                for mid in msg_ids:
+                    try:
+                        await user_client.delete_messages(entity, [mid])
+                    except Exception:
+                        pass
 
-            if not history.messages:
-                break
-
-            for msg in history.messages:
-                if msg.media and isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
-                    all_messages.append(msg)
-
-            total_fetched += len(history.messages)
-            offset_id      = history.messages[-1].id
-
-            now_t = asyncio.get_event_loop().time()
-            if now_t - last_scan_update >= 2.0:
-                last_scan_update = now_t
-                await status_msg.edit(
-                    f"📡 **Scan de l'historique**\n"
-                    f"📺 Canal : **{source_name}**\n"
-                    f"{route_info}\n\n"
-                    f"🔎 Messages parcourus : `{total_fetched}`\n"
-                    f"🎬 Médias trouvés : `{len(all_messages)}`\n"
-                    f"⏳ Scan en cours..."
-                )
-
-            if len(history.messages) < 100:
-                break
-            await asyncio.sleep(0.3)
-
-        if not all_messages:
+            deleted_total += len(msg_ids)
             await status_msg.edit(
-                f"📭 **Aucun média trouvé**\n\n"
-                f"Canal : **{source_name}**\n"
-                f"Messages parcourus : {total_fetched}"
+                f"🗑️ Suppression en cours dans **{dest['name']}**...\n"
+                f"✅ {deleted_total} messages supprimés..."
             )
+
+            if len(msg_ids) < batch_size:
+                break
+            await asyncio.sleep(0.5)
+
+        await status_msg.edit(
+            f"✅ **Canal vidé !**\n\n"
+            f"📬 Canal : **{dest['name']}**\n"
+            f"🗑️ Messages supprimés : **{deleted_total}**\n"
+            f"⏰ {now_paris().strftime('%d/%m/%Y à %H:%M')}"
+        )
+        logger.info(f"Canal vidé: {dest['name']} ({deleted_total} messages supprimés)")
+
+    except Exception as e:
+        logger.error(f"Erreur cleardest: {e}")
+        await status_msg.edit(f"❌ Erreur lors de la suppression : {e}")
+
+
+# ── Logique /gethistory ───────────────────────────────────────────────────────
+
+async def _do_gethistory(event, target_link: str):
+    """Récupère et envoie l'historique d'un canal source."""
+    status_msg = await event.respond("🔍 Connexion au canal en cours...")
+    try:
+        entity = await resolve_channel(target_link)
+    except ValueError as e:
+        await status_msg.edit(f"❌ {e}")
+        return
+
+    source_name = getattr(entity, "title", target_link)
+    source_id   = entity.id
+
+    routes_for_source = data.get_routes_for_source(source_id)
+    if routes_for_source:
+        dest_names = ", ".join(
+            next((d["name"] for d in data.destination_channels if d["id"] == r["dest_id"]), "?")
+            for r in routes_for_source
+        )
+        route_info = f"🔀 Règles : {len(routes_for_source)} destination(s) ({dest_names})"
+    else:
+        default    = data.get_default_dest()
+        dest_names = default["name"] if default else "?"
+        route_info = f"📬 Destination par défaut : {dest_names}"
+
+    all_messages     = []
+    offset_id        = 0
+    total_fetched    = 0
+    last_scan_update = 0.0
+
+    await status_msg.edit(
+        f"📡 **Scan de l'historique**\n"
+        f"📺 Canal : **{source_name}**\n"
+        f"{route_info}\n\n"
+        f"⏳ Récupération des messages..."
+    )
+
+    while True:
+        try:
+            history = await user_client(
+                GetHistoryRequest(
+                    peer=entity, limit=100, offset_date=None,
+                    offset_id=offset_id, max_id=0, min_id=0,
+                    add_offset=0, hash=0,
+                )
+            )
+        except FloodWaitError as e:
+            await asyncio.sleep(e.seconds + 1)
+            continue
+        except Exception as e:
+            await status_msg.edit(f"❌ Erreur récupération historique : {e}")
             return
 
-        new_messages = [m for m in all_messages if m.id not in data.history_ids]
-        skipped      = len(all_messages) - len(new_messages)
-        total_new    = len(new_messages)
+        if not history.messages:
+            break
 
-        if total_new == 0:
+        for msg in history.messages:
+            if msg.media and isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
+                all_messages.append(msg)
+
+        total_fetched += len(history.messages)
+        offset_id      = history.messages[-1].id
+
+        now_t = asyncio.get_event_loop().time()
+        if now_t - last_scan_update >= 2.0:
+            last_scan_update = now_t
             await status_msg.edit(
-                f"✅ **Déjà tout envoyé !**\n\n"
-                f"Canal : **{source_name}**\n"
-                f"Médias trouvés : {len(all_messages)}\n"
-                f"Déjà envoyés : {skipped}"
+                f"📡 **Scan de l'historique**\n"
+                f"📺 Canal : **{source_name}**\n"
+                f"{route_info}\n\n"
+                f"🔎 Messages parcourus : `{total_fetched}`\n"
+                f"🎬 Médias trouvés : `{len(all_messages)}`\n"
+                f"⏳ Scan en cours..."
             )
-            return
 
+        if len(history.messages) < 100:
+            break
+        await asyncio.sleep(0.3)
+
+    if not all_messages:
+        await status_msg.edit(
+            f"📭 **Aucun média trouvé**\n\n"
+            f"Canal : **{source_name}**\nMessages parcourus : {total_fetched}"
+        )
+        return
+
+    new_messages = [m for m in all_messages if m.id not in data.history_ids]
+    skipped      = len(all_messages) - len(new_messages)
+    total_new    = len(new_messages)
+
+    if total_new == 0:
+        await status_msg.edit(
+            f"✅ **Déjà tout envoyé !**\n\n"
+            f"Canal : **{source_name}**\n"
+            f"Médias trouvés : {len(all_messages)}\nDéjà envoyés : {skipped}"
+        )
+        return
+
+    await status_msg.edit(
+        f"📤 **Envoi en cours**\n"
+        f"📺 Canal : **{source_name}**\n"
+        f"{route_info}\n\n"
+        f"`{'░' * 16}` 0/{total_new}\n"
+        f"✅ Envoyés : 0  ❌ Échecs : 0\n"
+        f"⚡ Vitesse : calcul...\n⏱ Temps restant : calcul..."
+    )
+
+    async def live_progress(s, f, total, speed, eta):
+        bar       = _progress_bar(s + f, total)
+        speed_str = f"{speed:.1f} médias/min" if speed > 0 else "calcul..."
         await status_msg.edit(
             f"📤 **Envoi en cours**\n"
             f"📺 Canal : **{source_name}**\n"
             f"{route_info}\n\n"
-            f"`{'░' * 16}` 0/{total_new}\n"
-            f"✅ Envoyés : 0  ❌ Échecs : 0\n"
-            f"⚡ Vitesse : calcul...\n"
-            f"⏱ Temps restant : calcul..."
+            f"`{bar}` {s + f}/{total}\n"
+            f"✅ Envoyés : **{s}**  ❌ Échecs : **{f}**\n"
+            f"⚡ Vitesse : {speed_str}\n⏱ Temps restant : ~{eta}"
         )
 
-        async def live_progress(s, f, total, speed, eta):
-            bar        = _progress_bar(s + f, total)
-            speed_str  = f"{speed:.1f} médias/min" if speed > 0 else "calcul..."
-            await status_msg.edit(
-                f"📤 **Envoi en cours**\n"
-                f"📺 Canal : **{source_name}**\n"
-                f"{route_info}\n\n"
-                f"`{bar}` {s + f}/{total}\n"
-                f"✅ Envoyés : **{s}**  ❌ Échecs : **{f}**\n"
-                f"⚡ Vitesse : {speed_str}\n"
-                f"⏱ Temps restant : ~{eta}"
-            )
+    sent, failed = await process_message_queue(
+        new_messages, source_id, source_name, progress_callback=live_progress,
+    )
 
-        sent, failed = await process_message_queue(
-            new_messages, source_id, source_name,
-            progress_callback=live_progress,
-        )
+    for msg in new_messages:
+        data.history_ids.add(msg.id)
+    data.save()
 
-        for msg in new_messages:
-            data.history_ids.add(msg.id)
-        data.save()
-
-        bar_done = _progress_bar(total_new, total_new)
-        await status_msg.edit(
-            f"🏁 **Historique terminé !**\n"
-            f"📺 Canal : **{source_name}**\n\n"
-            f"`{bar_done}` {total_new}/{total_new}\n\n"
-            f"✅ Envoyés : **{sent}**\n"
-            f"❌ Échecs : **{failed}**\n"
-            f"⏭️ Déjà envoyés : {skipped}\n"
-            f"📊 Total trouvés : {len(all_messages)}"
-        )
+    bar_done = _progress_bar(total_new, total_new)
+    await status_msg.edit(
+        f"🏁 **Historique terminé !**\n"
+        f"📺 Canal : **{source_name}**\n\n"
+        f"`{bar_done}` {total_new}/{total_new}\n\n"
+        f"✅ Envoyés : **{sent}**\n"
+        f"❌ Échecs : **{failed}**\n"
+        f"⏭️ Déjà envoyés : {skipped}\n"
+        f"📊 Total trouvés : {len(all_messages)}"
+    )
 
 
 # ── Auto-sync GitHub ──────────────────────────────────────────────────────────
@@ -1303,25 +1832,27 @@ def auto_push_to_github():
         logger.warning(f"GitHub auto-sync échoué (non bloquant): {e}")
 
 
-# ── Enregistrement du menu de commandes Telegram ──────────────────────────────
+# ── Menu commandes Telegram ───────────────────────────────────────────────────
 
 async def register_bot_commands():
     commands = [
-        BotCommand(command="status",            description="État du bot"),
-        BotCommand(command="canaux",            description="Canaux sources surveillés"),
+        BotCommand(command="status",            description="État complet du bot"),
+        BotCommand(command="canaux",            description="Canaux sources"),
         BotCommand(command="addcanal",          description="Ajouter un canal source"),
         BotCommand(command="removecanal",       description="Supprimer un canal source"),
         BotCommand(command="destinations",      description="Canaux de réception"),
         BotCommand(command="adddestination",    description="Ajouter un canal de réception"),
         BotCommand(command="removedestination", description="Supprimer une destination"),
+        BotCommand(command="cleardest",         description="Vider tous les messages d'une destination"),
         BotCommand(command="routes",            description="Règles de routage"),
-        BotCommand(command="setroute",          description="Créer une règle source→dest+filtre"),
+        BotCommand(command="setroute",          description="Créer une règle source → dest + filtre"),
         BotCommand(command="removeroute",       description="Supprimer une règle"),
-        BotCommand(command="gethistory",        description="Récupérer tout l'historique"),
+        BotCommand(command="gethistory",        description="Récupérer l'historique d'un canal"),
         BotCommand(command="pause",             description="Mettre en pause"),
         BotCommand(command="resume",            description="Reprendre"),
         BotCommand(command="stats",             description="Statistiques"),
         BotCommand(command="clear",             description="Effacer l'historique des IDs"),
+        BotCommand(command="annuler",           description="Annuler l'action en cours"),
         BotCommand(command="help",              description="Aide complète"),
     ]
     try:
