@@ -9,6 +9,7 @@ import json
 import logging
 import os
 from datetime import datetime
+from io import BytesIO
 from zoneinfo import ZoneInfo
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -142,6 +143,57 @@ data = BotData()
 
 # ── Helpers globaux ───────────────────────────────────────────────────────────
 
+_EXT_MAP = {
+    "video/mp4": "mp4", "video/quicktime": "mov",
+    "video/x-matroska": "mkv", "video/webm": "webm",
+    "video/avi": "avi", "video/3gpp": "3gp",
+    "image/jpeg": "jpg", "image/png": "png",
+    "image/gif": "gif", "image/webp": "webp",
+}
+
+
+def _media_to_file(message, media_bytes: bytes):
+    """Prépare (file_obj, extra_kwargs) pour send_file selon le type de média.
+    Retourne (None, None) si type non supporté.
+    """
+    if isinstance(message.media, MessageMediaPhoto):
+        return media_bytes, {"force_document": False}
+
+    if isinstance(message.media, MessageMediaDocument):
+        doc = message.media.document
+        mime = doc.mime_type or ""
+        attrs = doc.attributes or []
+        is_video = mime.startswith("video/") or any(
+            type(a).__name__ == "DocumentAttributeVideo" for a in attrs
+        )
+        is_gif = mime == "image/gif" or any(
+            type(a).__name__ == "DocumentAttributeAnimated" for a in attrs
+        )
+        is_image = mime.startswith("image/") and not is_gif
+
+        if is_video:
+            ext = _EXT_MAP.get(mime, "mp4")
+            bio = BytesIO(media_bytes)
+            bio.name = f"video.{ext}"
+            return bio, {"force_document": False, "supports_streaming": True}
+        elif is_gif:
+            bio = BytesIO(media_bytes)
+            bio.name = "animation.gif"
+            return bio, {"force_document": False}
+        elif is_image:
+            ext = _EXT_MAP.get(mime, "jpg")
+            bio = BytesIO(media_bytes)
+            bio.name = f"photo.{ext}"
+            return bio, {"force_document": False}
+        else:
+            raw_ext = mime.split("/")[-1] if "/" in mime else "bin"
+            bio = BytesIO(media_bytes)
+            bio.name = f"file.{raw_ext}"
+            return bio, {"force_document": True}
+
+    return None, None
+
+
 async def get_dest_entity():
     """Cache l'entité destination — évite get_entity() à chaque message."""
     global _dest_entity_cache, _dest_entity_cache_id
@@ -262,7 +314,7 @@ async def resolve_channel(identifier: str):
 
 
 async def send_media_to_destination(message, caption_override: str = None) -> bool:
-    """Télécharge temporairement le média sur le disque et le renvoie en préservant le type original."""
+    """Télécharge et renvoie un média vers la destination en préservant le type."""
     dest_entity = await get_dest_entity()
     if not dest_entity:
         logger.warning("Destination non configurée ou introuvable")
@@ -270,36 +322,27 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
 
     caption = caption_override if caption_override is not None else (message.text or "")
 
-    os.makedirs("tmp", exist_ok=True)
-    
-    # Détection de l'extension idéale pour forcer le bon type d'affichage sur Telegram
-    ext = "jpg"
-    if isinstance(message.media, MessageMediaDocument):
-        mime = message.media.document.mime_type or ""
-        if "video" in mime:
-            ext = "mp4"
-        elif "gif" in mime:
-            ext = "gif"
-        elif "/" in mime:
-            ext = mime.split("/")[-1]
-
-    tmp_filepath = f"tmp/{message.id}.{ext}"
-
     try:
         async with DOWNLOAD_SEMAPHORE:
-            path = await user_client.download_media(message, file=tmp_filepath)
+            media_bytes = await user_client.download_media(message, bytes)
 
-        if not path or not os.path.exists(path):
+        if media_bytes is None:
             logger.warning(f"Téléchargement vide pour msg_id={message.id}")
             return False
 
+        file_obj, extra_kwargs = _media_to_file(message, media_bytes)
+        if file_obj is None:
+            return False
+
+        kwargs = dict(file=file_obj, caption=caption, **extra_kwargs)
+
         async with UPLOAD_SEMAPHORE:
             try:
-                await user_client.send_file(dest_entity, file=path, caption=caption)
+                await user_client.send_file(dest_entity, **kwargs)
             except Exception as e_user:
                 logger.warning(f"user_client.send_file échoué ({e_user}), essai bot_client…")
                 try:
-                    await bot_client.send_file(dest_entity, file=path, caption=caption)
+                    await bot_client.send_file(dest_entity, **kwargs)
                 except Exception as e_bot:
                     logger.error(f"bot_client.send_file échoué aussi: {e_bot}")
                     return False
@@ -316,76 +359,65 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
     except Exception as e:
         logger.error(f"Erreur envoi média (msg_id={getattr(message,'id','?')}): {e}")
         return False
-    finally:
-        if os.path.exists(tmp_filepath):
-            try:
-                os.remove(tmp_filepath)
-            except Exception:
-                pass
 
 
 async def send_album_to_destination(messages: list, source_name: str) -> int:
-    """Télécharge tous les médias sur le disque en parallèle et les envoie en un seul album groupé."""
+    """Télécharge tous les médias en parallèle et les envoie en un seul album groupé."""
     dest_entity = await get_dest_entity()
     if not dest_entity:
         return 0
 
-    os.makedirs("tmp", exist_ok=True)
-
     async def dl_one(msg):
-        ext = "jpg"
-        if isinstance(msg.media, MessageMediaDocument):
-            mime = msg.media.document.mime_type or ""
-            if "video" in mime:
-                ext = "mp4"
-            elif "gif" in mime:
-                ext = "gif"
-        filepath = f"tmp/{msg.id}.{ext}"
         try:
             async with DOWNLOAD_SEMAPHORE:
-                return await user_client.download_media(msg, file=filepath)
+                return await user_client.download_media(msg, bytes)
         except Exception as e:
             logger.warning(f"Échec dl album msg_id={msg.id}: {e}")
             return None
 
-    # Téléchargement parallèle de tous les fichiers de l'album sur le disque
+    # Téléchargement parallèle de tous les fichiers de l'album
     results = await asyncio.gather(*[dl_one(m) for m in messages])
-    valid_paths = [p for p in results if p and os.path.exists(p)]
 
-    if not valid_paths:
+    files = []
+    has_video = False
+    for msg, media_bytes in zip(messages, results):
+        if media_bytes is None:
+            continue
+        file_obj, extra = _media_to_file(msg, media_bytes)
+        if file_obj is not None:
+            files.append(file_obj)
+            if extra.get("supports_streaming"):
+                has_video = True
+
+    if not files:
         return 0
 
     caption = f"📺 Source: {source_name}\n📅 {now_paris().strftime('%d/%m/%Y à %H:%M')}"
-    captions = [caption] + [""] * (len(valid_paths) - 1)
+    captions = [caption] + [""] * (len(files) - 1)
 
-    send_kwargs = dict(file=valid_paths, caption=captions)
+    # Note: supports_streaming n'est pas compatible avec les listes dans Telethon —
+    # le .name sur chaque BytesIO suffit pour que Telegram détecte le type.
+    send_kwargs = dict(file=files, caption=captions)
 
     try:
         await user_client.send_file(dest_entity, **send_kwargs)
-        count = len(valid_paths)
+        return len(files)
     except Exception as e_user:
         logger.warning(f"user_client album échoué ({e_user}), essai bot_client…")
         try:
             await bot_client.send_file(dest_entity, **send_kwargs)
-            count = len(valid_paths)
+            return len(files)
         except Exception as e_bot:
             logger.error(f"Erreur envoi album bot_client: {e_bot}")
-            # Fallback : envoi un par un si l'album complet échoue
+            # Fallback : envoi un par un
             count = 0
-            for msg in messages:
+            for msg, mb in zip(messages, results):
+                if mb is None:
+                    continue
                 ok = await send_media_to_destination(msg)
                 if ok:
                     count += 1
-    finally:
-        # Nettoyage de tous les fichiers temporaires créés pour cet album
-        for path in valid_paths:
-            if os.path.exists(path):
-                try:
-                    os.remove(path)
-                except Exception:
-                    pass
-
-    return count
+            return count
 
 
 async def flush_album(grouped_id: int):
@@ -444,7 +476,7 @@ async def process_message_queue(
 ) -> tuple[int, int]:
     """
     Traite une liste de messages en parallèle par lots.
-    - progress_callback(sent, failed, total, speed, eta_str) : appelé après chaque envoi
+    - progress_callback(sent, failed, total, current_type) : appelé après chaque envoi
     - Suivi en direct via callback, mise à jour Telegram toutes les ~3s max
     """
     BATCH_SIZE = 8
@@ -465,6 +497,7 @@ async def process_message_queue(
     async def send_and_report(msg):
         nonlocal sent, failed, last_update
         result = await send_media_to_destination(msg)
+        media_type = "📸" if isinstance(msg.media, MessageMediaPhoto) else "🎬"
         if result is True:
             sent += 1
         else:
