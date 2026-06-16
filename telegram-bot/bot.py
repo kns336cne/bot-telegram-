@@ -248,12 +248,7 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
 
         async with UPLOAD_SEMAPHORE:
             if isinstance(message.media, MessageMediaPhoto):
-                await user_client.send_file(
-                    dest_entity,
-                    file=media_bytes,
-                    caption=caption,
-                    force_document=False,
-                )
+                kwargs = dict(file=media_bytes, caption=caption, force_document=False)
             elif isinstance(message.media, MessageMediaDocument):
                 doc = message.media.document
                 mime = doc.mime_type or ""
@@ -261,8 +256,7 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
                     type(attr).__name__ == "DocumentAttributeVideo"
                     for attr in (doc.attributes or [])
                 )
-                await user_client.send_file(
-                    dest_entity,
+                kwargs = dict(
                     file=media_bytes,
                     caption=caption,
                     force_document=not is_video,
@@ -270,6 +264,18 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
                 )
             else:
                 return False
+
+            # Essai 1 : user_client (admin ou groupe membre)
+            try:
+                await user_client.send_file(dest_entity, **kwargs)
+            except Exception as e_user:
+                logger.warning(f"user_client.send_file échoué ({e_user}), essai bot_client…")
+                # Essai 2 : bot_client (si le bot est admin du canal)
+                try:
+                    await bot_client.send_file(dest_entity, **kwargs)
+                except Exception as e_bot:
+                    logger.error(f"bot_client.send_file échoué aussi: {e_bot}")
+                    return False
 
         return True
 
@@ -740,6 +746,46 @@ def setup_bot_handlers():
         )
 
 
+def auto_push_to_github():
+    """Pousse bot.py vers GitHub automatiquement au démarrage si GITHUB_TOKEN est défini."""
+    token = os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return
+    import base64, json, urllib.request, urllib.error
+    owner, repo = "kns336cne", "bot-telegram-"
+    filepath = "telegram-bot/bot.py"
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+    }
+    try:
+        script_path = os.path.join(os.path.dirname(__file__), "bot.py")
+        with open(script_path, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode()
+        # Récupérer le sha actuel
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req) as r:
+                existing = json.loads(r.read())
+            sha = existing.get("sha")
+        except urllib.error.HTTPError:
+            sha = None
+        payload = {"message": "Auto-sync bot.py", "content": content_b64}
+        if sha:
+            payload["sha"] = sha
+        req2 = urllib.request.Request(
+            url, data=json.dumps(payload).encode(), headers=headers, method="PUT"
+        )
+        with urllib.request.urlopen(req2) as r:
+            code = r.status
+        logger.info(f"GitHub auto-sync: bot.py {'mis à jour' if code == 200 else 'créé'} (HTTP {code})")
+    except Exception as e:
+        logger.warning(f"GitHub auto-sync échoué (non bloquant): {e}")
+
+
 async def register_bot_commands():
     """Enregistre le menu de commandes visible dans Telegram (style BotFather)."""
     commands = [
@@ -770,6 +816,7 @@ async def main():
     global user_client, bot_client
 
     logger.info("Démarrage du bot...")
+    auto_push_to_github()
 
     if not SESSION_STRING:
         raise RuntimeError(
