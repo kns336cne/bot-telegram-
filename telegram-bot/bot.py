@@ -52,6 +52,9 @@ DATA_FILE = "bot_data.json"
 UPLOAD_SEMAPHORE = asyncio.Semaphore(3)
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)
 
+# Déduplication en mémoire : évite le double-envoi si l'event se déclenche 2x
+_seen_messages: set[tuple[int, int]] = set()
+
 user_client: TelegramClient = None
 bot_client: TelegramClient = None
 
@@ -220,14 +223,17 @@ async def resolve_channel(identifier: str):
 
 
 async def send_media_to_destination(message, caption_override: str = None) -> bool:
-    """Télécharge et renvoie un média vers la destination en préservant le type."""
-    if not data.destination:
+    """Télécharge et renvoie un média vers la destination en préservant le type.
+    Utilise user_client pour l'envoi (le bot n'est pas forcément admin du canal destination).
+    """
+    if not data.destination_id:
+        logger.warning("Destination non configurée (destination_id manquant)")
         return False
 
     try:
-        dest_entity = await user_client.get_entity(data.destination)
+        dest_entity = await user_client.get_entity(PeerChannel(data.destination_id))
     except Exception as e:
-        logger.error(f"Impossible de récupérer la destination: {e}")
+        logger.error(f"Impossible de récupérer la destination (id={data.destination_id}): {e}")
         return False
 
     caption = caption_override if caption_override is not None else (message.text or "")
@@ -237,11 +243,12 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
             media_bytes = await user_client.download_media(message, bytes)
 
         if media_bytes is None:
+            logger.warning(f"Téléchargement vide pour msg_id={message.id}")
             return False
 
         async with UPLOAD_SEMAPHORE:
             if isinstance(message.media, MessageMediaPhoto):
-                await bot_client.send_file(
+                await user_client.send_file(
                     dest_entity,
                     file=media_bytes,
                     caption=caption,
@@ -254,7 +261,7 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
                     type(attr).__name__ == "DocumentAttributeVideo"
                     for attr in (doc.attributes or [])
                 )
-                await bot_client.send_file(
+                await user_client.send_file(
                     dest_entity,
                     file=media_bytes,
                     caption=caption,
@@ -267,14 +274,14 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
         return True
 
     except FloodWaitError as e:
-        logger.warning(f"FloodWait: attente de {e.seconds}s")
+        logger.warning(f"FloodWait envoi: attente de {e.seconds}s")
         await asyncio.sleep(e.seconds + 1)
         return await send_media_to_destination(message, caption_override)
     except MediaEmptyError:
         logger.warning("Média vide, ignoré")
         return False
     except Exception as e:
-        logger.error(f"Erreur envoi média: {e}")
+        logger.error(f"Erreur envoi média (msg_id={getattr(message,'id','?')}): {e}")
         return False
 
 
@@ -364,7 +371,7 @@ def setup_user_handlers():
 
     @user_client.on(events.NewMessage())
     async def on_new_message(event):
-        if data.paused or not data.destination or not data.source_channels:
+        if data.paused or not data.destination_id or not data.source_channels:
             return
 
         try:
@@ -380,6 +387,12 @@ def setup_user_handlers():
             msg = event.message
             if not msg.media or not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
                 return
+
+            # Déduplication en mémoire (anti double-envoi lors de redémarrage)
+            msg_key = (chat_id, msg.id)
+            if msg_key in _seen_messages:
+                return
+            _seen_messages.add(msg_key)
 
             if msg.id in data.history_ids:
                 return
