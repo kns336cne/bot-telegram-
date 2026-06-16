@@ -36,7 +36,7 @@ from telethon.tl.types import (
 )
 
 logging.basicConfig(
-    level=logging.DEBUG,
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
@@ -50,11 +50,20 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 
 DATA_FILE = "bot_data.json"
 
-UPLOAD_SEMAPHORE = asyncio.Semaphore(3)
-DOWNLOAD_SEMAPHORE = asyncio.Semaphore(5)
+UPLOAD_SEMAPHORE = asyncio.Semaphore(5)
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(8)
 
 # Déduplication en mémoire : évite le double-envoi si l'event se déclenche 2x
 _seen_messages: set[tuple[int, int]] = set()
+
+# Cache entité destination (évite get_entity() à chaque message)
+_dest_entity_cache = None
+_dest_entity_cache_id: int | None = None
+
+# Buffer albums : grouped_id → [(message, source_name, chat_id)]
+_album_buffer: dict[int, list] = {}
+_album_flush_tasks: dict[int, asyncio.Task] = {}
+ALBUM_WAIT = 0.8  # secondes pour collecter tous les médias d'un album
 
 user_client: TelegramClient = None
 bot_client: TelegramClient = None
@@ -124,6 +133,80 @@ class BotData:
 
 
 data = BotData()
+
+# ── Helpers globaux ───────────────────────────────────────────────────────────
+
+_EXT_MAP = {
+    "video/mp4": "mp4", "video/quicktime": "mov",
+    "video/x-matroska": "mkv", "video/webm": "webm",
+    "video/avi": "avi", "video/3gpp": "3gp",
+    "image/jpeg": "jpg", "image/png": "png",
+    "image/gif": "gif", "image/webp": "webp",
+}
+
+
+def _media_to_file(message, media_bytes: bytes):
+    """Prépare (file_obj, extra_kwargs) pour send_file selon le type de média.
+    Retourne (None, None) si type non supporté.
+    """
+    if isinstance(message.media, MessageMediaPhoto):
+        return media_bytes, {"force_document": False}
+
+    if isinstance(message.media, MessageMediaDocument):
+        doc = message.media.document
+        mime = doc.mime_type or ""
+        attrs = doc.attributes or []
+        is_video = mime.startswith("video/") or any(
+            type(a).__name__ == "DocumentAttributeVideo" for a in attrs
+        )
+        is_gif = mime == "image/gif" or any(
+            type(a).__name__ == "DocumentAttributeAnimated" for a in attrs
+        )
+        is_image = mime.startswith("image/") and not is_gif
+
+        if is_video:
+            ext = _EXT_MAP.get(mime, "mp4")
+            bio = BytesIO(media_bytes)
+            bio.name = f"video.{ext}"
+            return bio, {"force_document": False, "supports_streaming": True}
+        elif is_gif:
+            bio = BytesIO(media_bytes)
+            bio.name = "animation.gif"
+            return bio, {"force_document": False}
+        elif is_image:
+            ext = _EXT_MAP.get(mime, "jpg")
+            bio = BytesIO(media_bytes)
+            bio.name = f"photo.{ext}"
+            return bio, {"force_document": False}
+        else:
+            raw_ext = mime.split("/")[-1] if "/" in mime else "bin"
+            bio = BytesIO(media_bytes)
+            bio.name = f"file.{raw_ext}"
+            return bio, {"force_document": True}
+
+    return None, None
+
+
+async def get_dest_entity():
+    """Cache l'entité destination — évite get_entity() à chaque message."""
+    global _dest_entity_cache, _dest_entity_cache_id
+    if _dest_entity_cache is not None and _dest_entity_cache_id == data.destination_id:
+        return _dest_entity_cache
+    if not data.destination_id:
+        return None
+    try:
+        _dest_entity_cache = await user_client.get_entity(PeerChannel(data.destination_id))
+        _dest_entity_cache_id = data.destination_id
+        return _dest_entity_cache
+    except Exception as e:
+        logger.error(f"Impossible de récupérer la destination (id={data.destination_id}): {e}")
+        return None
+
+
+def invalidate_dest_cache():
+    global _dest_entity_cache, _dest_entity_cache_id
+    _dest_entity_cache = None
+    _dest_entity_cache_id = None
 
 
 async def resolve_channel(identifier: str):
@@ -224,17 +307,10 @@ async def resolve_channel(identifier: str):
 
 
 async def send_media_to_destination(message, caption_override: str = None) -> bool:
-    """Télécharge et renvoie un média vers la destination en préservant le type.
-    Utilise user_client pour l'envoi (le bot n'est pas forcément admin du canal destination).
-    """
-    if not data.destination_id:
-        logger.warning("Destination non configurée (destination_id manquant)")
-        return False
-
-    try:
-        dest_entity = await user_client.get_entity(PeerChannel(data.destination_id))
-    except Exception as e:
-        logger.error(f"Impossible de récupérer la destination (id={data.destination_id}): {e}")
+    """Télécharge et renvoie un média vers la destination en préservant le type."""
+    dest_entity = await get_dest_entity()
+    if not dest_entity:
+        logger.warning("Destination non configurée ou introuvable")
         return False
 
     caption = caption_override if caption_override is not None else (message.text or "")
@@ -247,67 +323,17 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
             logger.warning(f"Téléchargement vide pour msg_id={message.id}")
             return False
 
+        file_obj, extra_kwargs = _media_to_file(message, media_bytes)
+        if file_obj is None:
+            return False
+
+        kwargs = dict(file=file_obj, caption=caption, **extra_kwargs)
+
         async with UPLOAD_SEMAPHORE:
-            _ext_map = {
-                "video/mp4": "mp4", "video/quicktime": "mov",
-                "video/x-matroska": "mkv", "video/webm": "webm",
-                "video/avi": "avi", "video/3gpp": "3gp",
-                "image/jpeg": "jpg", "image/png": "png",
-                "image/gif": "gif", "image/webp": "webp",
-            }
-
-            if isinstance(message.media, MessageMediaPhoto):
-                # Photo native Telegram → envoyer les bytes bruts, Telethon détecte JPEG/PNG
-                kwargs = dict(file=media_bytes, caption=caption, force_document=False)
-                logger.debug(f"Envoi PHOTO (bytes bruts, {len(media_bytes)} octets)")
-
-            elif isinstance(message.media, MessageMediaDocument):
-                doc = message.media.document
-                mime = doc.mime_type or ""
-                attrs = doc.attributes or []
-                is_video = mime.startswith("video/") or any(
-                    type(a).__name__ == "DocumentAttributeVideo" for a in attrs
-                )
-                is_gif = mime == "image/gif" or any(
-                    type(a).__name__ == "DocumentAttributeAnimated" for a in attrs
-                )
-                is_image = mime.startswith("image/") and not is_gif
-
-                logger.debug(f"Document reçu: mime={mime!r} is_video={is_video} is_image={is_image} is_gif={is_gif}")
-
-                if is_video:
-                    ext = _ext_map.get(mime, "mp4")
-                    file_io = BytesIO(media_bytes)
-                    file_io.name = f"video.{ext}"
-                    kwargs = dict(
-                        file=file_io,
-                        caption=caption,
-                        force_document=False,
-                        supports_streaming=True,   # ← clé pour afficher inline et pas en fichier
-                    )
-                elif is_gif:
-                    file_io = BytesIO(media_bytes)
-                    file_io.name = "animation.gif"
-                    kwargs = dict(file=file_io, caption=caption, force_document=False)
-                elif is_image:
-                    ext = _ext_map.get(mime, "jpg")
-                    file_io = BytesIO(media_bytes)
-                    file_io.name = f"photo.{ext}"
-                    kwargs = dict(file=file_io, caption=caption, force_document=False)
-                else:
-                    raw_ext = mime.split("/")[-1] if "/" in mime else "bin"
-                    file_io = BytesIO(media_bytes)
-                    file_io.name = f"file.{raw_ext}"
-                    kwargs = dict(file=file_io, caption=caption, force_document=True)
-            else:
-                return False
-
-            # Essai 1 : user_client (admin ou groupe membre)
             try:
                 await user_client.send_file(dest_entity, **kwargs)
             except Exception as e_user:
                 logger.warning(f"user_client.send_file échoué ({e_user}), essai bot_client…")
-                # Essai 2 : bot_client (si le bot est admin du canal)
                 try:
                     await bot_client.send_file(dest_entity, **kwargs)
                 except Exception as e_bot:
@@ -326,6 +352,104 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
     except Exception as e:
         logger.error(f"Erreur envoi média (msg_id={getattr(message,'id','?')}): {e}")
         return False
+
+
+async def send_album_to_destination(messages: list, source_name: str) -> int:
+    """Télécharge tous les médias en parallèle et les envoie en un seul album groupé."""
+    dest_entity = await get_dest_entity()
+    if not dest_entity:
+        return 0
+
+    async def dl_one(msg):
+        try:
+            async with DOWNLOAD_SEMAPHORE:
+                return await user_client.download_media(msg, bytes)
+        except Exception as e:
+            logger.warning(f"Échec dl album msg_id={msg.id}: {e}")
+            return None
+
+    # Téléchargement parallèle de tous les fichiers de l'album
+    results = await asyncio.gather(*[dl_one(m) for m in messages])
+
+    files = []
+    has_video = False
+    for msg, media_bytes in zip(messages, results):
+        if media_bytes is None:
+            continue
+        file_obj, extra = _media_to_file(msg, media_bytes)
+        if file_obj is not None:
+            files.append(file_obj)
+            if extra.get("supports_streaming"):
+                has_video = True
+
+    if not files:
+        return 0
+
+    caption = f"📺 Source: {source_name}\n📅 {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+    captions = [caption] + [""] * (len(files) - 1)
+
+    send_kwargs = dict(file=files, caption=captions, supports_streaming=has_video)
+
+    try:
+        await user_client.send_file(dest_entity, **send_kwargs)
+        return len(files)
+    except Exception as e_user:
+        logger.warning(f"user_client album échoué ({e_user}), essai bot_client…")
+        try:
+            await bot_client.send_file(dest_entity, **send_kwargs)
+            return len(files)
+        except Exception as e_bot:
+            logger.error(f"Erreur envoi album bot_client: {e_bot}")
+            # Fallback : envoi un par un
+            count = 0
+            for msg, mb in zip(messages, results):
+                if mb is None:
+                    continue
+                ok = await send_media_to_destination(msg)
+                if ok:
+                    count += 1
+            return count
+
+
+async def flush_album(grouped_id: int):
+    """Attend ALBUM_WAIT s pour collecter tous les médias du pack, puis envoie d'un coup."""
+    await asyncio.sleep(ALBUM_WAIT)
+    items = _album_buffer.pop(grouped_id, [])
+    _album_flush_tasks.pop(grouped_id, None)
+    if not items:
+        return
+
+    items.sort(key=lambda x: x[0].id)
+    source_name = items[0][1]
+    chat_id = items[0][2]
+
+    # Déduplication
+    new_msgs = []
+    for msg, _sname, cid in items:
+        msg_key = (cid, msg.id)
+        if msg_key in _seen_messages:
+            continue
+        _seen_messages.add(msg_key)
+        if msg.id in data.history_ids:
+            continue
+        data.history_ids.add(msg.id)
+        new_msgs.append(msg)
+
+    if not new_msgs:
+        return
+
+    data.save()
+    logger.info(f"Album groupé {grouped_id}: {len(new_msgs)} médias depuis {source_name}")
+
+    count = await send_album_to_destination(new_msgs, source_name)
+    if count > 0:
+        data.increment_stats(count)
+        await notify_owner(
+            f"✅ Album transféré ! ({count} médias)\n"
+            f"📚 Depuis **{source_name}**\n"
+            f"➡️ {data.destination}\n"
+            f"⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+        )
 
 
 def _progress_bar(done: int, total: int, width: int = 16) -> str:
@@ -387,7 +511,7 @@ async def process_message_queue(
         batch = media_messages[i:i + BATCH_SIZE]
         await asyncio.gather(*[send_and_report(msg) for msg in batch], return_exceptions=True)
         if i + BATCH_SIZE < total:
-            await asyncio.sleep(0.8)
+            await asyncio.sleep(0.3)
 
     # Mise à jour finale
     if progress_callback:
@@ -431,7 +555,24 @@ def setup_user_handlers():
             if not msg.media or not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
                 return
 
-            # Déduplication en mémoire (anti double-envoi lors de redémarrage)
+            source_name = next(
+                (ch["name"] for ch in data.source_channels if ch["id"] == chat_id),
+                str(chat_id),
+            )
+
+            # ── Album (pack de médias) → buffer + flush différé ───────────
+            if msg.grouped_id:
+                gid = msg.grouped_id
+                if gid not in _album_buffer:
+                    _album_buffer[gid] = []
+                _album_buffer[gid].append((msg, source_name, chat_id))
+                # Annuler le flush précédent et en créer un nouveau
+                if gid in _album_flush_tasks and not _album_flush_tasks[gid].done():
+                    _album_flush_tasks[gid].cancel()
+                _album_flush_tasks[gid] = asyncio.create_task(flush_album(gid))
+                return
+
+            # ── Média seul ────────────────────────────────────────────────
             msg_key = (chat_id, msg.id)
             if msg_key in _seen_messages:
                 return
@@ -441,11 +582,6 @@ def setup_user_handlers():
                 return
             data.history_ids.add(msg.id)
             data.save()
-
-            source_name = next(
-                (ch["name"] for ch in data.source_channels if ch["id"] == chat_id),
-                str(chat_id),
-            )
 
             caption_parts = []
             if msg.text:
@@ -572,6 +708,7 @@ def setup_bot_handlers():
             data.destination = link
             data.destination_id = entity.id
             data.save()
+            invalidate_dest_cache()
             await event.respond(f"✅ Destination : **{channel_name}**")
             logger.info(f"Destination définie: {channel_name} (id={entity.id})")
         except ValueError as e:
