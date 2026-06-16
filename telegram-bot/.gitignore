@@ -1,0 +1,40 @@
+# Sessions Telethon (contiennent des credentials)
+*.session
+*.session-journal
+user_session*
+bot_session*
+
+# Données du bot (canaux configurés, historique)
+bot_data.json
+
+# Variables d'environnement
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dossiers virtuels Python
+venv/
+env/
+.venv/
