@@ -10,6 +10,13 @@ import logging
 import os
 from datetime import datetime
 from io import BytesIO
+from zoneinfo import ZoneInfo
+
+PARIS = ZoneInfo("Europe/Paris")
+
+
+def now_paris() -> datetime:
+    return datetime.now(PARIS)
 
 from telethon import TelegramClient, events
 from telethon.errors import (
@@ -385,10 +392,12 @@ async def send_album_to_destination(messages: list, source_name: str) -> int:
     if not files:
         return 0
 
-    caption = f"📺 Source: {source_name}\n📅 {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+    caption = f"📺 Source: {source_name}\n📅 {now_paris().strftime('%d/%m/%Y à %H:%M')}"
     captions = [caption] + [""] * (len(files) - 1)
 
-    send_kwargs = dict(file=files, caption=captions, supports_streaming=has_video)
+    # Note: supports_streaming n'est pas compatible avec les listes dans Telethon —
+    # le .name sur chaque BytesIO suffit pour que Telegram détecte le type.
+    send_kwargs = dict(file=files, caption=captions)
 
     try:
         await user_client.send_file(dest_entity, **send_kwargs)
@@ -448,7 +457,7 @@ async def flush_album(grouped_id: int):
             f"✅ Album transféré ! ({count} médias)\n"
             f"📚 Depuis **{source_name}**\n"
             f"➡️ {data.destination}\n"
-            f"⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+            f"⏰ {now_paris().strftime('%d/%m/%Y à %H:%M')}"
         )
 
 
@@ -587,7 +596,7 @@ def setup_user_handlers():
             if msg.text:
                 caption_parts.append(msg.text)
             caption_parts.append(f"\n📺 Source: {source_name}")
-            caption_parts.append(f"📅 {datetime.now().strftime('%d/%m/%Y à %H:%M')}")
+            caption_parts.append(f"📅 {now_paris().strftime('%d/%m/%Y à %H:%M')}")
             caption = "\n".join(caption_parts)
 
             success = await send_media_to_destination(msg, caption)
@@ -599,7 +608,7 @@ def setup_user_handlers():
                     f"✅ Transfert réussi !\n"
                     f"{media_type} de **{source_name}**\n"
                     f"➡️ {data.destination}\n"
-                    f"⏰ {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+                    f"⏰ {now_paris().strftime('%d/%m/%Y à %H:%M')}"
                 )
             else:
                 logger.warning(f"Échec transfert depuis {source_name} (msg_id={msg.id})")
