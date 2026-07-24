@@ -2,14 +2,17 @@
 Telegram Bot - Transfert de médias entre canaux (y compris canaux restreints)
 Utilise Telethon (session utilisateur) pour accéder aux canaux sans forwarding
 et un client bot pour les commandes.
+
+Version améliorée : écriture JSON atomique, téléchargement sur disque,
+gestion d'erreurs plus sûre, multi-destinations, filtres de médias par canal.
 """
 
 import asyncio
 import json
 import logging
 import os
+import tempfile
 from datetime import datetime
-from io import BytesIO
 from zoneinfo import ZoneInfo
 
 PARIS = ZoneInfo("Europe/Paris")
@@ -56,18 +59,27 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 
 DATA_FILE = "bot_data.json"
+DOWNLOAD_DIR = os.environ.get("DOWNLOAD_DIR", tempfile.gettempdir())
 
 UPLOAD_SEMAPHORE = asyncio.Semaphore(5)
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(8)
 
+# Catégories de médias reconnues pour les filtres par canal
+CATEGORIES = ["photo", "video", "gif", "file"]
+CATEGORY_LABELS = {
+    "photo": "📸 Photos",
+    "video": "🎬 Vidéos",
+    "gif": "🌀 GIFs",
+    "file": "📄 Fichiers",
+}
+
 # Déduplication en mémoire : évite le double-envoi si l'event se déclenche 2x
 _seen_messages: set[tuple[int, int]] = set()
 
-# Cache entité destination (évite get_entity() à chaque message)
-_dest_entity_cache = None
-_dest_entity_cache_id: int | None = None
+# Cache entités destination (une par destination) — évite get_entity() à chaque message
+_dest_entity_cache: dict[int, object] = {}
 
-# Buffer albums : grouped_id → [(message, source_name, chat_id)]
+# Buffer albums : grouped_id → [(message, source_name, chat_id, dest_id)]
 _album_buffer: dict[int, list] = {}
 _album_flush_tasks: dict[int, asyncio.Task] = {}
 ALBUM_WAIT = 0.8  # secondes pour collecter tous les médias d'un album
@@ -79,9 +91,9 @@ bot_client: TelegramClient = None
 class BotData:
     def __init__(self):
         self.source_channels: list[dict] = []
-        self.destination: str | None = None
-        self.destination_id: int | None = None
+        self.destinations: list[dict] = []  # [{"id": channel_id, "name":.., "link":..}]
         self.paused: bool = False
+        self.dedupe_enabled: bool = True  # si False, renvoie tout même déjà transféré
         self.stats: dict = {"today": 0, "total": 0, "date": str(datetime.now().date())}
         self.history_ids: set[int] = set()
         self.invite_cache: dict[str, int] = {}  # invite_hash → channel_id
@@ -93,35 +105,61 @@ class BotData:
                 with open(DATA_FILE, "r") as f:
                     raw = json.load(f)
                 self.source_channels = raw.get("source_channels", [])
-                self.destination = raw.get("destination")
-                self.destination_id = raw.get("destination_id")
+                self.destinations = raw.get("destinations", [])
                 self.paused = raw.get("paused", False)
+                self.dedupe_enabled = raw.get("dedupe_enabled", True)
                 self.stats = raw.get("stats", self.stats)
                 self.history_ids = set(raw.get("history_ids", []))
                 self.invite_cache = raw.get("invite_cache", {})
+
+                # Migration depuis l'ancien format à destination unique
+                if not self.destinations and raw.get("destination_id"):
+                    self.destinations = [{
+                        "id": raw["destination_id"],
+                        "name": raw.get("destination") or "Destination",
+                        "link": raw.get("destination") or "",
+                    }]
+                    logger.info("Migration: ancienne destination unique convertie en liste.")
+
+                # S'assure que chaque canal source a bien les clés attendues
+                for ch in self.source_channels:
+                    ch.setdefault("dest_index", None)
+                    ch.setdefault("filters", list(CATEGORIES))
+
                 logger.info(
                     f"Données chargées: {len(self.source_channels)} canaux source, "
-                    f"destination={self.destination}"
+                    f"{len(self.destinations)} destination(s)"
                 )
             except Exception as e:
                 logger.error(f"Erreur chargement données: {e}")
 
     def save(self):
+        """Écriture atomique : écrit dans un fichier temporaire puis remplace
+        l'ancien via os.replace(), qui est atomique sur la plupart des OS.
+        Évite de corrompre bot_data.json si le process est tué en plein write."""
         try:
-            with open(DATA_FILE, "w") as f:
-                json.dump(
-                    {
-                        "source_channels": self.source_channels,
-                        "destination": self.destination,
-                        "destination_id": self.destination_id,
-                        "paused": self.paused,
-                        "stats": self.stats,
-                        "history_ids": list(self.history_ids),
-                        "invite_cache": self.invite_cache,
-                    },
-                    f,
-                    indent=2,
-                )
+            dir_name = os.path.dirname(os.path.abspath(DATA_FILE)) or "."
+            fd, tmp_path = tempfile.mkstemp(dir=dir_name, prefix=".bot_data_", suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w") as f:
+                    json.dump(
+                        {
+                            "source_channels": self.source_channels,
+                            "destinations": self.destinations,
+                            "paused": self.paused,
+                            "dedupe_enabled": self.dedupe_enabled,
+                            "stats": self.stats,
+                            "history_ids": list(self.history_ids),
+                            "invite_cache": self.invite_cache,
+                        },
+                        f,
+                        indent=2,
+                    )
+                os.replace(tmp_path, DATA_FILE)
+            except Exception:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
         except Exception as e:
             logger.error(f"Erreur sauvegarde: {e}")
 
@@ -138,6 +176,22 @@ class BotData:
         self.stats["total"] = self.stats.get("total", 0) + count
         self.save()
 
+    def get_channel_destination(self, channel: dict) -> dict | None:
+        """Retourne la destination (dict) vers laquelle ce canal doit envoyer,
+        ou None si aucune destination n'est configurée du tout."""
+        idx = channel.get("dest_index")
+        if idx and 1 <= idx <= len(self.destinations):
+            return self.destinations[idx - 1]
+        if self.destinations:
+            return self.destinations[0]
+        return None
+
+    def get_channel_filters(self, channel: dict) -> list[str]:
+        filters = channel.get("filters")
+        if not filters:
+            return list(CATEGORIES)
+        return filters
+
 
 data = BotData()
 
@@ -152,12 +206,12 @@ _EXT_MAP = {
 }
 
 
-def _media_to_file(message, media_bytes: bytes):
-    """Prépare (file_obj, extra_kwargs) pour send_file selon le type de média.
-    Retourne (None, None) si type non supporté.
-    """
+def _media_kind(message) -> tuple[str, str, bool]:
+    """Détermine (nom_fichier, categorie, force_document) pour un message média,
+    sans avoir besoin des bytes en mémoire.
+    categorie ∈ {"photo", "video", "gif", "file", "unknown"} — utilisée pour les filtres."""
     if isinstance(message.media, MessageMediaPhoto):
-        return media_bytes, {"force_document": False}
+        return "photo.jpg", "photo", False
 
     if isinstance(message.media, MessageMediaDocument):
         doc = message.media.document
@@ -173,47 +227,37 @@ def _media_to_file(message, media_bytes: bytes):
 
         if is_video:
             ext = _EXT_MAP.get(mime, "mp4")
-            bio = BytesIO(media_bytes)
-            bio.name = f"video.{ext}"
-            return bio, {"force_document": False, "supports_streaming": True}
+            return f"video.{ext}", "video", False
         elif is_gif:
-            bio = BytesIO(media_bytes)
-            bio.name = "animation.gif"
-            return bio, {"force_document": False}
+            return "animation.gif", "gif", False
         elif is_image:
             ext = _EXT_MAP.get(mime, "jpg")
-            bio = BytesIO(media_bytes)
-            bio.name = f"photo.{ext}"
-            return bio, {"force_document": False}
+            return f"photo.{ext}", "photo", False
         else:
             raw_ext = mime.split("/")[-1] if "/" in mime else "bin"
-            bio = BytesIO(media_bytes)
-            bio.name = f"file.{raw_ext}"
-            return bio, {"force_document": True}
+            return f"file.{raw_ext}", "file", True
 
-    return None, None
+    return "", "unknown", False
 
 
-async def get_dest_entity():
-    """Cache l'entité destination — évite get_entity() à chaque message."""
-    global _dest_entity_cache, _dest_entity_cache_id
-    if _dest_entity_cache is not None and _dest_entity_cache_id == data.destination_id:
-        return _dest_entity_cache
-    if not data.destination_id:
-        return None
+async def get_dest_entity(dest_id: int):
+    """Cache l'entité destination par id — évite get_entity() à chaque message."""
+    if dest_id in _dest_entity_cache:
+        return _dest_entity_cache[dest_id]
     try:
-        _dest_entity_cache = await user_client.get_entity(PeerChannel(data.destination_id))
-        _dest_entity_cache_id = data.destination_id
-        return _dest_entity_cache
+        entity = await user_client.get_entity(PeerChannel(dest_id))
+        _dest_entity_cache[dest_id] = entity
+        return entity
     except Exception as e:
-        logger.error(f"Impossible de récupérer la destination (id={data.destination_id}): {e}")
+        logger.error(f"Impossible de récupérer la destination (id={dest_id}): {e}")
         return None
 
 
-def invalidate_dest_cache():
-    global _dest_entity_cache, _dest_entity_cache_id
-    _dest_entity_cache = None
-    _dest_entity_cache_id = None
+def invalidate_dest_cache(dest_id: int | None = None):
+    if dest_id is None:
+        _dest_entity_cache.clear()
+    else:
+        _dest_entity_cache.pop(dest_id, None)
 
 
 async def resolve_channel(identifier: str):
@@ -224,11 +268,9 @@ async def resolve_channel(identifier: str):
     """
     identifier = identifier.strip()
 
-    # Extraire la partie utile des URLs t.me
     if "t.me/" in identifier:
         identifier = identifier.split("t.me/")[-1].strip("/")
 
-    # ── Lien d'invitation privé (+HASH) ──────────────────────────────────────
     if identifier.startswith("+"):
         invite_hash = identifier[1:]
 
@@ -237,7 +279,6 @@ async def resolve_channel(identifier: str):
                 return link.split("+")[-1].strip("/")
             return ""
 
-        # 1) Cache invite_hash → channel_id (aucun appel réseau)
         if invite_hash in data.invite_cache:
             try:
                 return await user_client.get_entity(PeerChannel(data.invite_cache[invite_hash]))
@@ -245,10 +286,9 @@ async def resolve_channel(identifier: str):
                 del data.invite_cache[invite_hash]
                 data.save()
 
-        # 2) Canaux connus (source + destination) → lookup par ID stocké
         known_links = [(ch.get("link", ""), ch["id"]) for ch in data.source_channels]
-        if data.destination and data.destination_id:
-            known_links.append((data.destination, data.destination_id))
+        for d in data.destinations:
+            known_links.append((d.get("link", ""), d["id"]))
 
         for link, cid in known_links:
             if _extract_hash(link) == invite_hash:
@@ -260,7 +300,6 @@ async def resolve_channel(identifier: str):
                 except Exception:
                     pass
 
-        # 3) ImportChatInviteRequest : rejoint le canal si pas encore membre
         try:
             joined = await user_client(ImportChatInviteRequest(hash=invite_hash))
             entity = joined.chats[0]
@@ -268,7 +307,6 @@ async def resolve_channel(identifier: str):
             data.save()
             return entity
         except UserAlreadyParticipantError:
-            # Déjà membre → CheckChatInviteRequest retourne directement l'entité du canal
             try:
                 result = await user_client(CheckChatInviteRequest(hash=invite_hash))
                 if isinstance(result, (ChatInviteAlready, ChatInvitePeek)):
@@ -298,9 +336,9 @@ async def resolve_channel(identifier: str):
                 f"({e.seconds // 60 + 1} min). Réessaie après."
             )
         except Exception as e:
-            raise ValueError(f"Impossible de rejoindre le canal `+{invite_hash}`: {e}")
+            logger.error(f"resolve_channel(+{invite_hash}) a échoué: {e}")
+            raise ValueError("Impossible de rejoindre ce canal. Vérifie le lien.")
 
-    # ── Canal public (@username ou ID) ───────────────────────────────────────
     if not identifier.startswith("@"):
         identifier = "@" + identifier
 
@@ -310,31 +348,63 @@ async def resolve_channel(identifier: str):
         try:
             return await user_client.get_entity(identifier.lstrip("@"))
         except Exception as e:
-            raise ValueError(f"Impossible de résoudre le canal `{identifier}`: {e}")
+            logger.error(f"resolve_channel({identifier}) a échoué: {e}")
+            raise ValueError(f"Impossible de résoudre le canal `{identifier}`.")
 
 
-async def send_media_to_destination(message, caption_override: str = None) -> bool:
-    """Télécharge et renvoie un média vers la destination en préservant le type."""
-    dest_entity = await get_dest_entity()
+async def _download_to_disk(message) -> str | None:
+    """Télécharge un média directement sur disque (jamais en RAM).
+    Retourne le chemin du fichier temporaire, ou None en cas d'échec."""
+    try:
+        async with DOWNLOAD_SEMAPHORE:
+            path = await user_client.download_media(message, file=DOWNLOAD_DIR)
+        return path
+    except Exception as e:
+        logger.warning(f"Échec téléchargement msg_id={getattr(message, 'id', '?')}: {e}")
+        return None
+
+
+def _rename_for_upload(path: str, message) -> str:
+    """Renomme le fichier téléchargé pour que Telegram détecte bien le type
+    (photo/vidéo/gif) à partir de l'extension, sans recharger le contenu en RAM."""
+    filename, category, _ = _media_kind(message)
+    if not filename:
+        return path
+    new_path = os.path.join(os.path.dirname(path), filename)
+    if new_path != path:
+        try:
+            os.replace(path, new_path)
+            return new_path
+        except Exception:
+            return path
+    return path
+
+
+async def send_media_to_destination(message, dest_id: int, caption_override: str = None) -> bool:
+    """Télécharge sur disque et renvoie un média vers la destination donnée."""
+    dest_entity = await get_dest_entity(dest_id)
     if not dest_entity:
-        logger.warning("Destination non configurée ou introuvable")
+        logger.warning(f"Destination {dest_id} introuvable")
         return False
 
     caption = caption_override if caption_override is not None else (message.text or "")
+    path = None
 
     try:
-        async with DOWNLOAD_SEMAPHORE:
-            media_bytes = await user_client.download_media(message, bytes)
-
-        if media_bytes is None:
-            logger.warning(f"Téléchargement vide pour msg_id={message.id}")
+        path = await _download_to_disk(message)
+        if path is None:
             return False
 
-        file_obj, extra_kwargs = _media_to_file(message, media_bytes)
-        if file_obj is None:
+        filename, category, force_doc = _media_kind(message)
+        if category == "unknown":
             return False
 
-        kwargs = dict(file=file_obj, caption=caption, **extra_kwargs)
+        path = _rename_for_upload(path, message)
+        extra_kwargs = {"force_document": force_doc}
+        if category == "video":
+            extra_kwargs["supports_streaming"] = True
+
+        kwargs = dict(file=path, caption=caption, **extra_kwargs)
 
         async with UPLOAD_SEMAPHORE:
             try:
@@ -352,113 +422,110 @@ async def send_media_to_destination(message, caption_override: str = None) -> bo
     except FloodWaitError as e:
         logger.warning(f"FloodWait envoi: attente de {e.seconds}s")
         await asyncio.sleep(e.seconds + 1)
-        return await send_media_to_destination(message, caption_override)
+        return await send_media_to_destination(message, dest_id, caption_override)
     except MediaEmptyError:
         logger.warning("Média vide, ignoré")
         return False
     except Exception as e:
         logger.error(f"Erreur envoi média (msg_id={getattr(message,'id','?')}): {e}")
         return False
+    finally:
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception as e:
+                logger.warning(f"Impossible de supprimer le fichier temporaire {path}: {e}")
 
 
-async def send_album_to_destination(messages: list, source_name: str) -> int:
-    """Télécharge tous les médias en parallèle et les envoie en un seul album groupé."""
-    dest_entity = await get_dest_entity()
+async def send_album_to_destination(messages: list, source_name: str, dest_id: int) -> int:
+    """Télécharge tous les médias en parallèle (sur disque) et les envoie en un album groupé."""
+    dest_entity = await get_dest_entity(dest_id)
     if not dest_entity:
         return 0
 
-    async def dl_one(msg):
-        try:
-            async with DOWNLOAD_SEMAPHORE:
-                return await user_client.download_media(msg, bytes)
-        except Exception as e:
-            logger.warning(f"Échec dl album msg_id={msg.id}: {e}")
-            return None
-
-    # Téléchargement parallèle de tous les fichiers de l'album
-    results = await asyncio.gather(*[dl_one(m) for m in messages])
+    downloaded = await asyncio.gather(*[_download_to_disk(m) for m in messages])
 
     files = []
-    has_video = False
-    for msg, media_bytes in zip(messages, results):
-        if media_bytes is None:
+    for msg, path in zip(messages, downloaded):
+        if path is None:
             continue
-        file_obj, extra = _media_to_file(msg, media_bytes)
-        if file_obj is not None:
-            files.append(file_obj)
-            if extra.get("supports_streaming"):
-                has_video = True
+        path = _rename_for_upload(path, msg)
+        files.append(path)
 
     if not files:
         return 0
 
     caption = f"📺 Source: {source_name}\n📅 {now_paris().strftime('%d/%m/%Y à %H:%M')}"
     captions = [caption] + [""] * (len(files) - 1)
-
-    # Note: supports_streaming n'est pas compatible avec les listes dans Telethon —
-    # le .name sur chaque BytesIO suffit pour que Telegram détecte le type.
     send_kwargs = dict(file=files, caption=captions)
 
     try:
-        await user_client.send_file(dest_entity, **send_kwargs)
-        return len(files)
-    except Exception as e_user:
-        logger.warning(f"user_client album échoué ({e_user}), essai bot_client…")
         try:
-            await bot_client.send_file(dest_entity, **send_kwargs)
+            await user_client.send_file(dest_entity, **send_kwargs)
             return len(files)
-        except Exception as e_bot:
-            logger.error(f"Erreur envoi album bot_client: {e_bot}")
-            # Fallback : envoi un par un
-            count = 0
-            for msg, mb in zip(messages, results):
-                if mb is None:
-                    continue
-                ok = await send_media_to_destination(msg)
-                if ok:
-                    count += 1
-            return count
+        except Exception as e_user:
+            logger.warning(f"user_client album échoué ({e_user}), essai bot_client…")
+            try:
+                await bot_client.send_file(dest_entity, **send_kwargs)
+                return len(files)
+            except Exception as e_bot:
+                logger.error(f"Erreur envoi album bot_client: {e_bot}")
+                count = 0
+                for msg in messages:
+                    ok = await send_media_to_destination(msg, dest_id)
+                    if ok:
+                        count += 1
+                return count
+    finally:
+        for path in files:
+            if os.path.exists(path):
+                try:
+                    os.remove(path)
+                except Exception as e:
+                    logger.warning(f"Impossible de supprimer {path}: {e}")
 
 
 async def flush_album(grouped_id: int):
     """Attend ALBUM_WAIT s pour collecter tous les médias du pack, puis envoie d'un coup."""
-    await asyncio.sleep(ALBUM_WAIT)
-    items = _album_buffer.pop(grouped_id, [])
-    _album_flush_tasks.pop(grouped_id, None)
-    if not items:
-        return
+    try:
+        await asyncio.sleep(ALBUM_WAIT)
+        items = _album_buffer.pop(grouped_id, [])
+        if not items:
+            return
 
-    items.sort(key=lambda x: x[0].id)
-    source_name = items[0][1]
-    chat_id = items[0][2]
+        items.sort(key=lambda x: x[0].id)
+        source_name = items[0][1]
+        dest_id = items[0][3]
 
-    # Déduplication
-    new_msgs = []
-    for msg, _sname, cid in items:
-        msg_key = (cid, msg.id)
-        if msg_key in _seen_messages:
-            continue
-        _seen_messages.add(msg_key)
-        if msg.id in data.history_ids:
-            continue
-        data.history_ids.add(msg.id)
-        new_msgs.append(msg)
+        new_msgs = []
+        for msg, _sname, cid, _did in items:
+            msg_key = (cid, msg.id)
+            if msg_key in _seen_messages:
+                continue
+            _seen_messages.add(msg_key)
+            if data.dedupe_enabled and msg.id in data.history_ids:
+                continue
+            data.history_ids.add(msg.id)
+            new_msgs.append(msg)
 
-    if not new_msgs:
-        return
+        if not new_msgs:
+            return
 
-    data.save()
-    logger.info(f"Album groupé {grouped_id}: {len(new_msgs)} médias depuis {source_name}")
+        data.save()
+        logger.info(f"Album groupé {grouped_id}: {len(new_msgs)} médias depuis {source_name}")
 
-    count = await send_album_to_destination(new_msgs, source_name)
-    if count > 0:
-        data.increment_stats(count)
-        await notify_owner(
-            f"✅ Album transféré ! ({count} médias)\n"
-            f"📚 Depuis **{source_name}**\n"
-            f"➡️ {data.destination}\n"
-            f"⏰ {now_paris().strftime('%d/%m/%Y à %H:%M')}"
-        )
+        count = await send_album_to_destination(new_msgs, source_name, dest_id)
+        if count > 0:
+            data.increment_stats(count)
+            await notify_owner(
+                f"✅ Album transféré ! ({count} médias)\n"
+                f"📚 Depuis **{source_name}**\n"
+                f"⏰ {now_paris().strftime('%d/%m/%Y à %H:%M')}"
+            )
+    except Exception as e:
+        logger.error(f"Erreur flush_album({grouped_id}): {e}")
+    finally:
+        _album_flush_tasks.pop(grouped_id, None)
 
 
 def _progress_bar(done: int, total: int, width: int = 16) -> str:
@@ -471,6 +538,7 @@ def _progress_bar(done: int, total: int, width: int = 16) -> str:
 
 async def process_message_queue(
     messages: list,
+    dest_id: int,
     source_name: str = "",
     progress_callback=None,
 ) -> tuple[int, int]:
@@ -496,13 +564,11 @@ async def process_message_queue(
 
     async def send_and_report(msg):
         nonlocal sent, failed, last_update
-        result = await send_media_to_destination(msg)
-        media_type = "📸" if isinstance(msg.media, MessageMediaPhoto) else "🎬"
+        result = await send_media_to_destination(msg, dest_id)
         if result is True:
             sent += 1
         else:
             failed += 1
-        # Mise à jour toutes les 3 secondes max pour éviter FloodWait
         now = asyncio.get_event_loop().time()
         if progress_callback and (now - last_update) >= 3.0:
             last_update = now
@@ -522,17 +588,12 @@ async def process_message_queue(
         if i + BATCH_SIZE < total:
             await asyncio.sleep(0.3)
 
-    # Mise à jour finale
     if progress_callback:
         await progress_callback(sent, failed, total, 0, "0s")
 
     data.increment_stats(sent)
     logger.info(f"Lot terminé: {sent} envoyés, {failed} échecs")
     return sent, failed
-
-
-def is_owner(sender_id: int) -> bool:
-    return sender_id == OWNER_ID
 
 
 async def notify_owner(text: str):
@@ -547,7 +608,7 @@ def setup_user_handlers():
 
     @user_client.on(events.NewMessage())
     async def on_new_message(event):
-        if data.paused or not data.destination_id or not data.source_channels:
+        if data.paused or not data.source_channels or not data.destinations:
             return
 
         try:
@@ -556,38 +617,44 @@ def setup_user_handlers():
             if chat_id is None:
                 return
 
-            source_ids = [ch["id"] for ch in data.source_channels]
-            if chat_id not in source_ids:
+            channel = next((ch for ch in data.source_channels if ch["id"] == chat_id), None)
+            if channel is None:
                 return
 
             msg = event.message
             if not msg.media or not isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
                 return
 
-            source_name = next(
-                (ch["name"] for ch in data.source_channels if ch["id"] == chat_id),
-                str(chat_id),
-            )
+            # ── Filtre par type de média ────────────────────────────────
+            _, category, _ = _media_kind(msg)
+            if category == "unknown" or category not in data.get_channel_filters(channel):
+                return
 
-            # ── Album (pack de médias) → buffer + flush différé ───────────
+            dest = data.get_channel_destination(channel)
+            if dest is None:
+                return
+            dest_id = dest["id"]
+            source_name = channel["name"]
+
             if msg.grouped_id:
                 gid = msg.grouped_id
                 if gid not in _album_buffer:
                     _album_buffer[gid] = []
-                _album_buffer[gid].append((msg, source_name, chat_id))
-                # Annuler le flush précédent et en créer un nouveau
+                _album_buffer[gid].append((msg, source_name, chat_id, dest_id))
                 if gid in _album_flush_tasks and not _album_flush_tasks[gid].done():
                     _album_flush_tasks[gid].cancel()
                 _album_flush_tasks[gid] = asyncio.create_task(flush_album(gid))
                 return
 
-            # ── Média seul ────────────────────────────────────────────────
+            # _seen_messages protège toujours contre un double déclenchement du
+            # même event (pas lié au réglage /doublons, c'est juste anti-doublon
+            # technique). Le suivi history_ids, lui, respecte /doublons.
             msg_key = (chat_id, msg.id)
             if msg_key in _seen_messages:
                 return
             _seen_messages.add(msg_key)
 
-            if msg.id in data.history_ids:
+            if data.dedupe_enabled and msg.id in data.history_ids:
                 return
             data.history_ids.add(msg.id)
             data.save()
@@ -599,15 +666,15 @@ def setup_user_handlers():
             caption_parts.append(f"📅 {now_paris().strftime('%d/%m/%Y à %H:%M')}")
             caption = "\n".join(caption_parts)
 
-            success = await send_media_to_destination(msg, caption)
-            media_type = "📸 Photo" if isinstance(msg.media, MessageMediaPhoto) else "🎬 Vidéo"
+            success = await send_media_to_destination(msg, dest_id, caption)
+            media_type = CATEGORY_LABELS.get(category, category)
 
             if success:
                 logger.info(f"Média transféré depuis {source_name} (msg_id={msg.id})")
                 await notify_owner(
                     f"✅ Transfert réussi !\n"
                     f"{media_type} de **{source_name}**\n"
-                    f"➡️ {data.destination}\n"
+                    f"➡️ {dest['name']}\n"
                     f"⏰ {now_paris().strftime('%d/%m/%Y à %H:%M')}"
                 )
             else:
@@ -615,6 +682,18 @@ def setup_user_handlers():
 
         except Exception as e:
             logger.error(f"Erreur handler new message: {e}")
+
+
+def _parse_index(text: str, max_len: int) -> int | None:
+    """Parse un numéro 1-based fourni par l'utilisateur, retourne l'index 1-based
+    valide ou None."""
+    try:
+        n = int(text)
+    except ValueError:
+        return None
+    if 1 <= n <= max_len:
+        return n
+    return None
 
 
 def setup_bot_handlers():
@@ -641,17 +720,26 @@ def setup_bot_handlers():
     async def cmd_help(event):
         await event.respond(
             "🤖 **Commandes disponibles**\n\n"
-            "**📡 Canaux**\n"
+            "**📡 Canaux source**\n"
             "`/addcanal` `<lien>` — ajouter un canal source\n"
             "`/removecanal` `<n°>` — supprimer un canal source\n"
-            "`/canaux` — voir les canaux surveillés\n"
-            "`/setdestination` `<lien>` — définir la destination\n\n"
+            "`/canaux` — voir les canaux surveillés (destination + filtres)\n\n"
+            "**🎯 Destinations**\n"
+            "`/adddestination` `<lien>` — ajouter une destination\n"
+            "`/destinations` — lister les destinations\n"
+            "`/removedestination` `<n°>` — supprimer une destination\n"
+            "`/routecanal` `<n° canal> <n° destination>` — router un canal vers une destination\n\n"
+            "**🎛️ Filtres de médias**\n"
+            "`/filtrecanal` `<n° canal> <photo|video|gif|file|tous>` — définir les types autorisés\n"
+            "(plusieurs types séparés par une virgule, ex: `photo,video`)\n\n"
             "**⚙️ Contrôle**\n"
             "`/pause` — mettre en pause\n"
             "`/resume` — reprendre\n"
-            "`/clear` — effacer l'historique des IDs\n\n"
+            "`/clear` — effacer l'historique des IDs\n"
+            "`/doublons` `on|off` — activer/désactiver la déduplication\n\n"
             "**📥 Historique**\n"
-            "`/gethistory` `<lien>` — récupérer tout l'historique\n\n"
+            "`/gethistory` `<lien>` — récupérer tout l'historique, du plus ancien "
+            "au plus récent (respecte /doublons)\n\n"
             "**📊 Infos**\n"
             "`/status` — état du bot\n"
             "`/stats` — statistiques\n"
@@ -670,26 +758,37 @@ def setup_bot_handlers():
             if any(ch["id"] == channel_id for ch in data.source_channels):
                 await event.respond(f"⚠️ **{channel_name}** est déjà dans la liste.")
                 return
-            data.source_channels.append({"id": channel_id, "name": channel_name, "link": link})
+            data.source_channels.append({
+                "id": channel_id,
+                "name": channel_name,
+                "link": link,
+                "dest_index": None,
+                "filters": list(CATEGORIES),
+            })
             data.save()
-            await event.respond(f"✅ Canal ajouté : **{channel_name}**")
+            await event.respond(
+                f"✅ Canal ajouté : **{channel_name}**\n"
+                f"➡️ Destination : {data.destinations[0]['name'] if data.destinations else 'aucune — utilise /adddestination'}\n"
+                f"🎛️ Filtres : tous les types"
+            )
             logger.info(f"Canal source ajouté: {channel_name} ({channel_id})")
         except ValueError as e:
             await event.respond(f"❌ {e}")
         except Exception as e:
-            await event.respond(f"❌ Erreur : {e}")
+            logger.error(f"cmd_addcanal({link}) a échoué: {e}")
+            await event.respond("❌ Une erreur est survenue. Vérifie le lien et réessaie.")
 
     @bot_client.on(events.NewMessage(
         pattern=r"^/removecanal(@\w+)?\s+(\d+)$", incoming=True, from_users=OWN
     ))
     async def cmd_removecanal(event):
-        num = int(event.pattern_match.group(2)) - 1
-        if 0 <= num < len(data.source_channels):
-            removed = data.source_channels.pop(num)
-            data.save()
-            await event.respond(f"🗑️ Canal supprimé : **{removed['name']}**")
-        else:
+        idx = _parse_index(event.pattern_match.group(2), len(data.source_channels))
+        if idx is None:
             await event.respond("❌ Numéro invalide. Utilise `/canaux` pour voir la liste.")
+            return
+        removed = data.source_channels.pop(idx - 1)
+        data.save()
+        await event.respond(f"🗑️ Canal supprimé : **{removed['name']}**")
 
     @bot_client.on(events.NewMessage(
         pattern=r"^/canaux(@\w+)?$", incoming=True, from_users=OWN
@@ -702,28 +801,151 @@ def setup_bot_handlers():
             return
         lines = ["📋 **Canaux surveillés :**\n"]
         for i, ch in enumerate(data.source_channels, 1):
-            lines.append(f"{i}. **{ch['name']}**")
-        lines.append(f"\n📍 Destination : {data.destination or 'non définie'}")
+            dest = data.get_channel_destination(ch)
+            dest_name = dest["name"] if dest else "⚠️ aucune destination"
+            filters = data.get_channel_filters(ch)
+            if len(filters) == len(CATEGORIES):
+                filters_str = "tous"
+            else:
+                filters_str = ", ".join(CATEGORY_LABELS.get(f, f) for f in filters)
+            lines.append(
+                f"{i}. **{ch['name']}**\n"
+                f"   ➡️ {dest_name}  |  🎛️ {filters_str}"
+            )
         await event.respond("\n".join(lines))
 
+    # ── Destinations ──────────────────────────────────────────────────────
+
     @bot_client.on(events.NewMessage(
-        pattern=r"^/setdestination(@\w+)?\s+(.+)$", incoming=True, from_users=OWN
+        pattern=r"^/adddestination(@\w+)?\s+(.+)$", incoming=True, from_users=OWN
     ))
-    async def cmd_setdestination(event):
+    async def cmd_adddestination(event):
         link = event.pattern_match.group(2).strip()
         try:
             entity = await resolve_channel(link)
             channel_name = getattr(entity, "title", link)
-            data.destination = link
-            data.destination_id = entity.id
+            if any(d["id"] == entity.id for d in data.destinations):
+                await event.respond(f"⚠️ **{channel_name}** est déjà une destination.")
+                return
+            data.destinations.append({"id": entity.id, "name": channel_name, "link": link})
             data.save()
-            invalidate_dest_cache()
-            await event.respond(f"✅ Destination : **{channel_name}**")
-            logger.info(f"Destination définie: {channel_name} (id={entity.id})")
+            is_first = len(data.destinations) == 1
+            await event.respond(
+                f"✅ Destination ajoutée : **{channel_name}**"
+                + ("\n(utilisée par défaut pour les canaux sans routage spécifique)" if is_first else "")
+            )
+            logger.info(f"Destination ajoutée: {channel_name} (id={entity.id})")
         except ValueError as e:
             await event.respond(f"❌ {e}")
         except Exception as e:
-            await event.respond(f"❌ Erreur : {e}")
+            logger.error(f"cmd_adddestination({link}) a échoué: {e}")
+            await event.respond("❌ Une erreur est survenue. Vérifie le lien et réessaie.")
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/destinations(@\w+)?$", incoming=True, from_users=OWN
+    ))
+    async def cmd_destinations(event):
+        if not data.destinations:
+            await event.respond(
+                "📋 Aucune destination.\nUtilise `/adddestination <lien>` pour en ajouter."
+            )
+            return
+        lines = ["🎯 **Destinations :**\n"]
+        for i, d in enumerate(data.destinations, 1):
+            tag = " (défaut)" if i == 1 else ""
+            lines.append(f"{i}. **{d['name']}**{tag}")
+        await event.respond("\n".join(lines))
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/removedestination(@\w+)?\s+(\d+)$", incoming=True, from_users=OWN
+    ))
+    async def cmd_removedestination(event):
+        idx = _parse_index(event.pattern_match.group(2), len(data.destinations))
+        if idx is None:
+            await event.respond("❌ Numéro invalide. Utilise `/destinations` pour voir la liste.")
+            return
+        removed = data.destinations.pop(idx - 1)
+        invalidate_dest_cache(removed["id"])
+        # Les canaux routés spécifiquement vers un index invalide retombent
+        # automatiquement sur la destination par défaut (voir get_channel_destination).
+        data.save()
+        await event.respond(
+            f"🗑️ Destination supprimée : **{removed['name']}**\n"
+            f"Les canaux qui pointaient vers elle utilisent maintenant la destination par défaut."
+        )
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/routecanal(@\w+)?\s+(\d+)\s+(\d+)$", incoming=True, from_users=OWN
+    ))
+    async def cmd_routecanal(event):
+        canal_idx = _parse_index(event.pattern_match.group(2), len(data.source_channels))
+        dest_idx = _parse_index(event.pattern_match.group(3), len(data.destinations))
+        if canal_idx is None:
+            await event.respond("❌ Numéro de canal invalide. Utilise `/canaux` pour voir la liste.")
+            return
+        if dest_idx is None:
+            await event.respond("❌ Numéro de destination invalide. Utilise `/destinations` pour voir la liste.")
+            return
+        channel = data.source_channels[canal_idx - 1]
+        channel["dest_index"] = dest_idx
+        data.save()
+        await event.respond(
+            f"✅ **{channel['name']}** est maintenant routé vers "
+            f"**{data.destinations[dest_idx - 1]['name']}**"
+        )
+
+    # ── Filtres ───────────────────────────────────────────────────────────
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/filtrecanal(@\w+)?\s+(\d+)\s+(\S+)$", incoming=True, from_users=OWN
+    ))
+    async def cmd_filtrecanal(event):
+        canal_idx = _parse_index(event.pattern_match.group(2), len(data.source_channels))
+        if canal_idx is None:
+            await event.respond("❌ Numéro de canal invalide. Utilise `/canaux` pour voir la liste.")
+            return
+
+        raw_filters = event.pattern_match.group(3).strip().lower()
+        if raw_filters == "tous":
+            new_filters = list(CATEGORIES)
+        else:
+            requested = [f.strip() for f in raw_filters.split(",") if f.strip()]
+            invalid = [f for f in requested if f not in CATEGORIES]
+            if invalid or not requested:
+                await event.respond(
+                    f"❌ Type(s) invalide(s) : {', '.join(invalid) if invalid else raw_filters}\n"
+                    f"Valeurs possibles : `photo`, `video`, `gif`, `file`, ou `tous`."
+                )
+                return
+            new_filters = requested
+
+        channel = data.source_channels[canal_idx - 1]
+        channel["filters"] = new_filters
+        data.save()
+        filters_str = "tous" if len(new_filters) == len(CATEGORIES) else ", ".join(
+            CATEGORY_LABELS.get(f, f) for f in new_filters
+        )
+        await event.respond(f"✅ Filtre de **{channel['name']}** mis à jour : {filters_str}")
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/doublons(@\w+)?(?:\s+(on|off))?$", incoming=True, from_users=OWN
+    ))
+    async def cmd_doublons(event):
+        choice = event.pattern_match.group(2)
+        if choice is None:
+            state = "✅ activé (les médias déjà transférés sont ignorés)" if data.dedupe_enabled \
+                else "❌ désactivé (tout est renvoyé, même déjà transféré)"
+            await event.respond(f"🔁 **Déduplication** : {state}\n\nUtilise `/doublons on` ou `/doublons off`.")
+            return
+        data.dedupe_enabled = (choice == "on")
+        data.save()
+        if data.dedupe_enabled:
+            await event.respond("✅ Déduplication **activée** — les médias déjà envoyés seront ignorés.")
+        else:
+            await event.respond(
+                "⚠️ Déduplication **désactivée** — `/gethistory` et la surveillance en direct "
+                "vont renvoyer TOUS les médias, y compris ceux déjà transférés."
+            )
 
     @bot_client.on(events.NewMessage(
         pattern=r"^/pause(@\w+)?$", incoming=True, from_users=OWN
@@ -755,14 +977,18 @@ def setup_bot_handlers():
     ))
     async def cmd_status(event):
         state = "⏸️ En pause" if data.paused else "▶️ Actif"
-        dest = data.destination or "Non configurée"
+        dedupe_state = "✅ activée" if data.dedupe_enabled else "❌ désactivée"
+        dest_list = "\n".join(
+            f"  • {d['name']}" for d in data.destinations
+        ) or "  Aucune — utilise /adddestination"
         src_list = "\n".join(
             f"  • {ch['name']}" for ch in data.source_channels
         ) or "  Aucun"
         await event.respond(
             f"📊 **État du bot**\n\n"
             f"État : {state}\n"
-            f"Destination : `{dest}`\n"
+            f"Déduplication : {dedupe_state}\n"
+            f"Destinations ({len(data.destinations)}) :\n{dest_list}\n\n"
             f"Sources ({len(data.source_channels)}) :\n{src_list}\n"
             f"IDs suivis : {len(data.history_ids)}"
         )
@@ -782,10 +1008,10 @@ def setup_bot_handlers():
         pattern=r"^/gethistory(@\w+)?(?:\s+(.+))?$", incoming=True, from_users=OWN
     ))
     async def cmd_gethistory(event):
-        if not data.destination:
+        if not data.destinations:
             await event.respond(
                 "❌ Aucune destination configurée.\n"
-                "Utilise `/setdestination <lien>` d'abord."
+                "Utilise `/adddestination <lien>` d'abord."
             )
             return
 
@@ -797,9 +1023,14 @@ def setup_bot_handlers():
             await event.respond("❌ Spécifie un canal : `/gethistory @canal`")
             return
 
-        status_msg = await event.respond(
-            "🔍 Connexion au canal en cours..."
+        # Destination : celle du canal si déjà connu, sinon la destination par défaut
+        known_channel = next(
+            (ch for ch in data.source_channels if ch.get("link") == target_link), None
         )
+        dest = data.get_channel_destination(known_channel) if known_channel else data.destinations[0]
+        dest_id = dest["id"]
+
+        status_msg = await event.respond("🔍 Connexion au canal en cours...")
 
         try:
             entity = await resolve_channel(target_link)
@@ -808,6 +1039,7 @@ def setup_bot_handlers():
             return
 
         source_name = getattr(entity, "title", target_link)
+        allowed_filters = data.get_channel_filters(known_channel) if known_channel else list(CATEGORIES)
         all_messages = []
         offset_id = 0
         total_fetched = 0
@@ -815,11 +1047,11 @@ def setup_bot_handlers():
 
         await status_msg.edit(
             f"📡 **Scan de l'historique**\n"
-            f"📺 Canal : **{source_name}**\n\n"
+            f"📺 Canal : **{source_name}**\n"
+            f"➡️ Destination : **{dest['name']}**\n\n"
             f"⏳ Récupération des messages..."
         )
 
-        # ── Phase 1 : scan de l'historique ──────────────────────────────────
         while True:
             try:
                 history = await user_client(
@@ -838,7 +1070,8 @@ def setup_bot_handlers():
                 await asyncio.sleep(e.seconds + 1)
                 continue
             except Exception as e:
-                await status_msg.edit(f"❌ Erreur récupération historique : {e}")
+                logger.error(f"cmd_gethistory: erreur récupération historique: {e}")
+                await status_msg.edit("❌ Erreur lors de la récupération de l'historique.")
                 return
 
             if not history.messages:
@@ -846,7 +1079,9 @@ def setup_bot_handlers():
 
             for msg in history.messages:
                 if msg.media and isinstance(msg.media, (MessageMediaPhoto, MessageMediaDocument)):
-                    all_messages.append(msg)
+                    _, cat, _ = _media_kind(msg)
+                    if cat in allowed_filters:
+                        all_messages.append(msg)
 
             total_fetched += len(history.messages)
             offset_id = history.messages[-1].id
@@ -874,7 +1109,14 @@ def setup_bot_handlers():
             )
             return
 
-        new_messages = [m for m in all_messages if m.id not in data.history_ids]
+        # Tri chronologique : la toute première vidéo/photo postée dans le canal
+        # part en premier, jusqu'à la plus récente.
+        all_messages.sort(key=lambda m: m.id)
+
+        if data.dedupe_enabled:
+            new_messages = [m for m in all_messages if m.id not in data.history_ids]
+        else:
+            new_messages = all_messages  # /doublons off : renvoie tout, même déjà transféré
         skipped = len(all_messages) - len(new_messages)
         total_new = len(new_messages)
 
@@ -896,7 +1138,6 @@ def setup_bot_handlers():
             f"⏱ Temps restant : calcul..."
         )
 
-        # ── Phase 2 : envoi avec suivi en direct ────────────────────────────
         async def live_progress(s, f, total, speed, eta):
             bar = _progress_bar(s + f, total)
             speed_str = f"{speed:.1f} médias/min" if speed > 0 else "calcul..."
@@ -910,7 +1151,7 @@ def setup_bot_handlers():
             )
 
         sent, failed = await process_message_queue(
-            new_messages, source_name, progress_callback=live_progress
+            new_messages, dest_id, source_name, progress_callback=live_progress
         )
 
         for msg in new_messages:
@@ -930,13 +1171,22 @@ def setup_bot_handlers():
 
 
 def auto_push_to_github():
-    """Pousse bot.py vers GitHub automatiquement au démarrage si GITHUB_TOKEN est défini."""
+    """
+    Pousse bot.py vers GitHub automatiquement au démarrage si GITHUB_AUTO_PUSH=1
+    ET GITHUB_TOKEN est défini. Désactivé par défaut : à activer explicitement
+    pour éviter des pushes accidentels si plusieurs instances tournent en parallèle.
+    """
+    if os.environ.get("GITHUB_AUTO_PUSH", "0") != "1":
+        return
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
+        logger.warning("GITHUB_AUTO_PUSH=1 mais GITHUB_TOKEN manquant, sync ignorée.")
         return
-    import base64, json, urllib.request, urllib.error
-    owner, repo = "kns336cne", "bot-telegram-"
-    filepath = "telegram-bot/bot.py"
+
+    import base64, urllib.request, urllib.error
+    owner = os.environ.get("GITHUB_REPO_OWNER", "kns336cne")
+    repo = os.environ.get("GITHUB_REPO_NAME", "bot-telegram-")
+    filepath = os.environ.get("GITHUB_FILE_PATH", "telegram-bot/bot.py")
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{filepath}"
     headers = {
         "Authorization": f"token {token}",
@@ -948,7 +1198,7 @@ def auto_push_to_github():
         script_path = os.path.join(os.path.dirname(__file__), "bot.py")
         with open(script_path, "rb") as f:
             content_b64 = base64.b64encode(f.read()).decode()
-        # Récupérer le sha actuel
+
         req = urllib.request.Request(url, headers=headers)
         try:
             with urllib.request.urlopen(req) as r:
@@ -956,6 +1206,7 @@ def auto_push_to_github():
             sha = existing.get("sha")
         except urllib.error.HTTPError:
             sha = None
+
         payload = {"message": "Auto-sync bot.py", "content": content_b64}
         if sha:
             payload["sha"] = sha
@@ -972,17 +1223,22 @@ def auto_push_to_github():
 async def register_bot_commands():
     """Enregistre le menu de commandes visible dans Telegram (style BotFather)."""
     commands = [
-        BotCommand(command="status",        description="État du bot"),
-        BotCommand(command="canaux",        description="Canaux surveillés"),
-        BotCommand(command="addcanal",      description="Ajouter un canal source"),
-        BotCommand(command="removecanal",   description="Supprimer un canal source"),
-        BotCommand(command="setdestination",description="Définir le canal de destination"),
-        BotCommand(command="gethistory",    description="Récupérer tout l'historique"),
-        BotCommand(command="pause",         description="Mettre en pause"),
-        BotCommand(command="resume",        description="Reprendre"),
-        BotCommand(command="stats",         description="Statistiques"),
-        BotCommand(command="clear",         description="Effacer l'historique des IDs"),
-        BotCommand(command="help",          description="Aide"),
+        BotCommand(command="status",            description="État du bot"),
+        BotCommand(command="canaux",             description="Canaux surveillés"),
+        BotCommand(command="addcanal",           description="Ajouter un canal source"),
+        BotCommand(command="removecanal",        description="Supprimer un canal source"),
+        BotCommand(command="destinations",       description="Lister les destinations"),
+        BotCommand(command="adddestination",     description="Ajouter une destination"),
+        BotCommand(command="removedestination",  description="Supprimer une destination"),
+        BotCommand(command="routecanal",         description="Router un canal vers une destination"),
+        BotCommand(command="filtrecanal",        description="Filtrer les types de médias d'un canal"),
+        BotCommand(command="gethistory",         description="Récupérer tout l'historique"),
+        BotCommand(command="pause",              description="Mettre en pause"),
+        BotCommand(command="resume",             description="Reprendre"),
+        BotCommand(command="doublons",           description="Activer/désactiver la déduplication"),
+        BotCommand(command="stats",              description="Statistiques"),
+        BotCommand(command="clear",              description="Effacer l'historique des IDs"),
+        BotCommand(command="help",               description="Aide"),
     ]
     try:
         await bot_client(SetBotCommandsRequest(
@@ -1024,7 +1280,6 @@ async def main():
     )
 
     try:
-        # Connexion manuelle du client utilisateur (évite le prompt interactif)
         await user_client.connect()
         if not await user_client.is_user_authorized():
             raise RuntimeError(
@@ -1033,7 +1288,6 @@ async def main():
             )
         logger.info("Client utilisateur connecté avec SESSION_STRING")
 
-        # Démarrage du client bot
         await bot_client.start(bot_token=BOT_TOKEN)
         logger.info("Client bot démarré")
 
@@ -1046,12 +1300,13 @@ async def main():
         logger.info(f"Client utilisateur: {me.first_name} (@{getattr(me, 'username', 'N/A')})")
         logger.info(f"Client bot: @{bot_me.username}")
 
+        dest_summary = ", ".join(d["name"] for d in data.destinations) or "Non configurée"
         await notify_owner(
             f"🚀 **Bot démarré !**\n\n"
             f"👤 Compte : {me.first_name}\n"
             f"🤖 Bot : @{bot_me.username}\n"
             f"📡 Canaux surveillés : {len(data.source_channels)}\n"
-            f"📍 Destination : {data.destination or 'Non configurée'}"
+            f"🎯 Destinations : {dest_summary}"
         )
 
         logger.info("Bot opérationnel, en attente de nouveaux messages...")
