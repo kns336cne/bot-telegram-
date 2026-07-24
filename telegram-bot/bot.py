@@ -86,6 +86,9 @@ ALBUM_WAIT = 0.8  # secondes pour collecter tous les médias d'un album
 
 user_client: TelegramClient = None
 bot_client: TelegramClient = None
+_start_time: datetime | None = None
+_me_info: dict = {}  # infos du compte utilisateur connecté (rempli au démarrage)
+_bot_me_info: dict = {}  # infos du bot (rempli au démarrage)
 
 
 class BotData:
@@ -95,6 +98,7 @@ class BotData:
         self.paused: bool = False
         self.dedupe_enabled: bool = True  # si False, renvoie tout même déjà transféré
         self.stats: dict = {"today": 0, "total": 0, "date": str(datetime.now().date())}
+        self.channel_stats: dict[str, int] = {}  # str(channel_id) → total envoyé
         self.history_ids: set[int] = set()
         self.invite_cache: dict[str, int] = {}  # invite_hash → channel_id
         self._load()
@@ -109,6 +113,7 @@ class BotData:
                 self.paused = raw.get("paused", False)
                 self.dedupe_enabled = raw.get("dedupe_enabled", True)
                 self.stats = raw.get("stats", self.stats)
+                self.channel_stats = raw.get("channel_stats", {})
                 self.history_ids = set(raw.get("history_ids", []))
                 self.invite_cache = raw.get("invite_cache", {})
 
@@ -149,6 +154,7 @@ class BotData:
                             "paused": self.paused,
                             "dedupe_enabled": self.dedupe_enabled,
                             "stats": self.stats,
+                            "channel_stats": self.channel_stats,
                             "history_ids": list(self.history_ids),
                             "invite_cache": self.invite_cache,
                         },
@@ -170,10 +176,13 @@ class BotData:
             self.stats["date"] = today
             self.save()
 
-    def increment_stats(self, count=1):
+    def increment_stats(self, count=1, channel_id: int | None = None):
         self.reset_stats_if_new_day()
         self.stats["today"] = self.stats.get("today", 0) + count
         self.stats["total"] = self.stats.get("total", 0) + count
+        if channel_id is not None:
+            key = str(channel_id)
+            self.channel_stats[key] = self.channel_stats.get(key, 0) + count
         self.save()
 
     def get_channel_destination(self, channel: dict) -> dict | None:
@@ -495,6 +504,7 @@ async def flush_album(grouped_id: int):
 
         items.sort(key=lambda x: x[0].id)
         source_name = items[0][1]
+        source_chat_id = items[0][2]
         dest_id = items[0][3]
 
         new_msgs = []
@@ -516,7 +526,7 @@ async def flush_album(grouped_id: int):
 
         count = await send_album_to_destination(new_msgs, source_name, dest_id)
         if count > 0:
-            data.increment_stats(count)
+            data.increment_stats(count, channel_id=source_chat_id)
             await notify_owner(
                 f"✅ Album transféré ! ({count} médias)\n"
                 f"📚 Depuis **{source_name}**\n"
@@ -541,6 +551,7 @@ async def process_message_queue(
     dest_id: int,
     source_name: str = "",
     progress_callback=None,
+    source_channel_id: int | None = None,
 ) -> tuple[int, int]:
     """
     Traite une liste de messages en parallèle par lots.
@@ -591,7 +602,7 @@ async def process_message_queue(
     if progress_callback:
         await progress_callback(sent, failed, total, 0, "0s")
 
-    data.increment_stats(sent)
+    data.increment_stats(sent, channel_id=source_channel_id)
     logger.info(f"Lot terminé: {sent} envoyés, {failed} échecs")
     return sent, failed
 
@@ -670,6 +681,7 @@ def setup_user_handlers():
             media_type = CATEGORY_LABELS.get(category, category)
 
             if success:
+                data.increment_stats(1, channel_id=chat_id)
                 logger.info(f"Média transféré depuis {source_name} (msg_id={msg.id})")
                 await notify_owner(
                     f"✅ Transfert réussi !\n"
@@ -715,6 +727,97 @@ def setup_bot_handlers():
         )
 
     @bot_client.on(events.NewMessage(
+        pattern=r"^/whoami(@\w+)?$", incoming=True, from_users=OWN
+    ))
+    async def cmd_whoami(event):
+        user_str = (
+            f"{_me_info.get('first_name', '?')} "
+            f"(@{_me_info.get('username') or 'N/A'}, id={_me_info.get('id', '?')})"
+        )
+        bot_str = f"@{_bot_me_info.get('username', '?')} (id={_bot_me_info.get('id', '?')})"
+        await event.respond(
+            f"🪪 **Identité du bot**\n\n"
+            f"👤 Compte utilisateur : {user_str}\n"
+            f"🤖 Bot : {bot_str}\n"
+            f"🔑 OWNER_ID configuré : `{OWNER_ID}`\n"
+            f"📨 Cette commande vient de : `{event.sender_id}`"
+        )
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/ping(@\w+)?$", incoming=True, from_users=OWN
+    ))
+    async def cmd_ping(event):
+        t0 = asyncio.get_event_loop().time()
+        msg = await event.respond("🏓 Ping...")
+        rtt_ms = int((asyncio.get_event_loop().time() - t0) * 1000)
+        uptime_str = "inconnu"
+        if _start_time:
+            delta = now_paris() - _start_time
+            h, rem = divmod(int(delta.total_seconds()), 3600)
+            m, s = divmod(rem, 60)
+            uptime_str = f"{h}h {m}m {s}s"
+        user_ok = "✅" if user_client and user_client.is_connected() else "❌"
+        bot_ok = "✅" if bot_client and bot_client.is_connected() else "❌"
+        await msg.edit(
+            f"🏓 **Pong !** ({rtt_ms} ms)\n\n"
+            f"Client utilisateur : {user_ok}\n"
+            f"Client bot : {bot_ok}\n"
+            f"⏱ En ligne depuis : {uptime_str}"
+        )
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/statscanal(@\w+)?\s+(\d+)$", incoming=True, from_users=OWN
+    ))
+    async def cmd_statscanal(event):
+        idx = _parse_index(event.pattern_match.group(2), len(data.source_channels))
+        if idx is None:
+            await event.respond("❌ Numéro invalide. Utilise `/canaux` pour voir la liste.")
+            return
+        channel = data.source_channels[idx - 1]
+        count = data.channel_stats.get(str(channel["id"]), 0)
+        dest = data.get_channel_destination(channel)
+        await event.respond(
+            f"📈 **Statistiques — {channel['name']}**\n\n"
+            f"Médias transférés : **{count}**\n"
+            f"➡️ Destination : {dest['name'] if dest else 'aucune'}"
+        )
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/testdestination(@\w+)?\s+(\d+)$", incoming=True, from_users=OWN
+    ))
+    async def cmd_testdestination(event):
+        idx = _parse_index(event.pattern_match.group(2), len(data.destinations))
+        if idx is None:
+            await event.respond("❌ Numéro invalide. Utilise `/destinations` pour voir la liste.")
+            return
+        dest = data.destinations[idx - 1]
+        entity = await get_dest_entity(dest["id"])
+        if not entity:
+            await event.respond(f"❌ Impossible de joindre **{dest['name']}** — vérifie que le compte y a toujours accès.")
+            return
+        try:
+            await user_client.send_message(
+                entity,
+                f"✅ Test de connexion depuis le bot — {now_paris().strftime('%d/%m/%Y à %H:%M')}",
+            )
+            await event.respond(f"✅ Message de test envoyé vers **{dest['name']}**.")
+        except Exception as e:
+            logger.error(f"cmd_testdestination({dest['name']}) a échoué: {e}")
+            await event.respond(f"❌ Échec de l'envoi vers **{dest['name']}**. Vérifie les droits du compte sur ce canal.")
+
+    @bot_client.on(events.NewMessage(
+        pattern=r"^/backup(@\w+)?$", incoming=True, from_users=OWN
+    ))
+    async def cmd_backup(event):
+        if not os.path.exists(DATA_FILE):
+            await event.respond("❌ Aucune donnée à sauvegarder pour le moment.")
+            return
+        await event.respond(
+            file=DATA_FILE,
+            message=f"💾 Sauvegarde de la configuration — {now_paris().strftime('%d/%m/%Y à %H:%M')}",
+        )
+
+    @bot_client.on(events.NewMessage(
         pattern=r"^/help(@\w+)?$", incoming=True, from_users=OWN
     ))
     async def cmd_help(event):
@@ -742,7 +845,12 @@ def setup_bot_handlers():
             "au plus récent (respecte /doublons)\n\n"
             "**📊 Infos**\n"
             "`/status` — état du bot\n"
-            "`/stats` — statistiques\n"
+            "`/stats` — statistiques globales\n"
+            "`/statscanal` `<n°>` — statistiques d'un canal précis\n"
+            "`/whoami` — infos du compte connecté et OWNER_ID\n"
+            "`/ping` — vérifie la connexion et l'uptime\n"
+            "`/testdestination` `<n°>` — envoie un message test vers une destination\n"
+            "`/backup` — reçois `bot_data.json` en fichier\n"
             "`/help` — cette aide"
         )
 
@@ -1151,7 +1259,8 @@ def setup_bot_handlers():
             )
 
         sent, failed = await process_message_queue(
-            new_messages, dest_id, source_name, progress_callback=live_progress
+            new_messages, dest_id, source_name, progress_callback=live_progress,
+            source_channel_id=entity.id,
         )
 
         for msg in new_messages:
@@ -1237,6 +1346,11 @@ async def register_bot_commands():
         BotCommand(command="resume",             description="Reprendre"),
         BotCommand(command="doublons",           description="Activer/désactiver la déduplication"),
         BotCommand(command="stats",              description="Statistiques"),
+        BotCommand(command="statscanal",         description="Statistiques d'un canal"),
+        BotCommand(command="whoami",             description="Infos du compte connecté"),
+        BotCommand(command="ping",               description="Vérifier la connexion"),
+        BotCommand(command="testdestination",    description="Tester une destination"),
+        BotCommand(command="backup",             description="Exporter la configuration"),
         BotCommand(command="clear",              description="Effacer l'historique des IDs"),
         BotCommand(command="help",               description="Aide"),
     ]
@@ -1299,6 +1413,18 @@ async def main():
         bot_me = await bot_client.get_me()
         logger.info(f"Client utilisateur: {me.first_name} (@{getattr(me, 'username', 'N/A')})")
         logger.info(f"Client bot: @{bot_me.username}")
+
+        global _start_time
+        _start_time = now_paris()
+        _me_info.update({
+            "id": me.id,
+            "first_name": me.first_name,
+            "username": getattr(me, "username", None),
+        })
+        _bot_me_info.update({
+            "id": bot_me.id,
+            "username": bot_me.username,
+        })
 
         dest_summary = ", ".join(d["name"] for d in data.destinations) or "Non configurée"
         await notify_owner(
